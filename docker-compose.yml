@@ -1,0 +1,34 @@
+services:
+  zedcode:
+    build: .
+    restart: unless-stopped
+    # Pas de "ports:" : le proxy de Coolify (Traefik/Caddy) route vers 8080
+    # via le champ Domains = https://code.zedxp.com:8080
+    expose:
+      - "8080"
+    environment:
+      ACCESS_TOKEN: ${ACCESS_TOKEN}
+      ROOM_TTL: ${ROOM_TTL:-72h}
+      MAX_DOC_BYTES: ${MAX_DOC_BYTES:-1048576}
+      MAX_TOTAL_BYTES: ${MAX_TOTAL_BYTES:-33554432}
+    volumes:
+      - zedcode-data:/data
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/zedcode", "-healthcheck"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 96M
+
+volumes:
+  zedcode-data:

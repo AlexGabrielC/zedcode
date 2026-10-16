@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>zedcode</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<header>
+  <a class="brand" href="/">zedcode</a>
+  <span id="status" class="status"></span>
+  <span id="peers" class="peers"></span>
+  <nav id="actions" hidden>
+    <button id="btn-new" type="button">Nouveau</button>
+    <button id="btn-copy" type="button">Copier le lien</button>
+    <button id="btn-download" type="button">Télécharger</button>
+    <button id="btn-logout" type="button">Déconnexion</button>
+  </nav>
+</header>
+<main>
+  <form id="login" class="login" hidden>
+    <label for="token">Jeton d'accès</label>
+    <input id="token" type="password" autocomplete="current-password" required>
+    <button type="submit">Entrer</button>
+    <p id="login-error" class="error" hidden></p>
+  </form>
+  <p id="fatal" class="error" hidden></p>
+  <textarea id="editor" spellcheck="false" autocapitalize="off" autocomplete="off"
+            aria-label="Éditeur de code" placeholder="Colle ou tape ton code ici…" hidden></textarea>
+</main>
+</body>
+</html>
