@@ -1,12 +1,13 @@
 # zedcode
 
 Partage de code en temps réel entre tes machines, façon codeshare, auto-hébergé.
-Go, bibliothèque standard uniquement (zéro dépendance), image Docker `scratch` d'environ 10 Mo.
+Serveur Go sans dépendance (bibliothèque standard), éditeur CodeMirror 6 côté navigateur,
+image Docker `scratch` d'environ 12 Mo, environ 3 Mo de RAM au repos.
 
 ## Utilisation
 
 - `https://code.zedxp.com` → crée une salle et redirige vers `https://code.zedxp.com/aB3x9Z`.
-- Sur l'autre PC : tape `code.zedxp.com/aB3x9Z`, ou saisis le code dans « Rejoindre ».
+- Sur l'autre PC : tape `code.zedxp.com/aB3x9Z`, ou saisis le code dans le champ « Code » puis la flèche.
 - Barre d'outils :
   - **code de salle** (en haut à gauche) : un clic copie le lien ;
   - **langage** : coloration syntaxique (SQL, Java, Bash, Python, Go…), partagé par tous les appareils de la salle ;
@@ -42,8 +43,8 @@ Code de salle : 6 caractères `[A-Za-z0-9]`, soit 62⁶ = 56 800 235 584 combina
 |---|---|---|
 | `ROOM_TTL` | `2h` | Durée de vie d'une salle inactive |
 | `JOIN_PER_MINUTE` | `30` | Ouvertures de salle max par IP et par minute |
-| `MAX_DOC_BYTES` | `1048576` | Taille max d'un document |
-| `MAX_TOTAL_BYTES` | `33554432` | Quota total en mémoire (borne la RAM) |
+| `MAX_DOC_BYTES` | `1048576` | Taille max d'un document (octets) |
+| `MAX_TOTAL_BYTES` | `33554432` | Quota total des documents en mémoire (octets) |
 | `MAX_ROOMS` | `500` | Nombre max de salles |
 | `MAX_CONNECTIONS` | `200` | Appareils connectés simultanément, toutes salles confondues |
 | `TRUST_PROXY` | `1` (compose) | Lit l'IP client dans `X-Forwarded-For` (uniquement derrière un proxy) |
