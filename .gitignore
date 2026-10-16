@@ -1,3 +1,4 @@
 /zedcode
-/data/
 .env
+/web/*.gz
+/editor/node_modules/

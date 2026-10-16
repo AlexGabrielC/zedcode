@@ -6,9 +6,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"embed"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -21,6 +25,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -37,6 +42,7 @@ const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789
 var (
 	roomRe   = regexp.MustCompile(`^[A-Za-z0-9]{6}$`)
 	clientRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,32}$`)
+	langRe   = regexp.MustCompile(`^[a-z0-9]{0,16}$`)
 
 	errFull     = errors.New("quota mémoire atteint")
 	errTooMany  = errors.New("trop de salles ou de connexions")
@@ -107,6 +113,7 @@ func loadConfig() (config, error) {
 type event struct {
 	V uint64 `json:"v"`
 	T string `json:"t"`
+	L string `json:"l,omitempty"` // langage choisi, partagé par la salle
 	F string `json:"f,omitempty"`
 }
 
@@ -205,7 +212,7 @@ func (s *store) unsubscribe(id string, sb *sub) {
 	s.presenceLocked(r)
 }
 
-func (s *store) put(id, text, from string) (uint64, error) {
+func (s *store) put(id, text, lang, from string) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r, ok := s.rooms[id]
@@ -216,7 +223,7 @@ func (s *store) put(id, text, from string) (uint64, error) {
 		return 0, errFull
 	}
 	s.total += len(text) - len(r.ev.T)
-	r.ev = event{V: r.ev.V + 1, T: text, F: from}
+	r.ev = event{V: r.ev.V + 1, T: text, L: lang, F: from}
 	r.updated = time.Now()
 	for sb := range r.subs {
 		offer(sb.doc, r.ev)
@@ -291,10 +298,12 @@ func (l *limiter) prune(now time.Time) {
 // ---------------------------------------------------------------- server
 
 type server struct {
-	cfg   config
-	st    *store
-	lim   *limiter
-	index []byte
+	cfg     config
+	st      *store
+	lim     *limiter
+	static  fs.FS
+	version string // empreinte des fichiers web : URL versionnées, cache long
+	index   []byte
 }
 
 // clientIP : derrière le proxy de Coolify (Traefik/Caddy), l'IP réelle est
@@ -341,14 +350,23 @@ func (s *server) handleNew(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/"+code, http.StatusFound)
 }
 
+const csp = "default-src 'none'; script-src 'self'; style-src 'self'%s; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+
+// handleIndex sert la page avec un nonce CSP neuf : il autorise uniquement la
+// balise <style> que l'éditeur (CodeMirror) injecte, sans 'unsafe-inline'.
 func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if !roomRe.MatchString(r.PathValue("id")) {
 		http.NotFound(w, r)
 		return
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Write(s.index)
+	nb := make([]byte, 16)
+	rand.Read(nb)
+	nonce := base64.StdEncoding.EncodeToString(nb)
+	h := w.Header()
+	h.Set("Content-Security-Policy", fmt.Sprintf(csp, " 'nonce-"+nonce+"'"))
+	h.Set("Content-Type", "text/html; charset=utf-8")
+	h.Set("Cache-Control", "no-store")
+	w.Write(bytes.Replace(s.index, []byte("__NONCE__"), []byte(nonce), 1))
 }
 
 func writeSSE(w http.ResponseWriter, name string, v any) error {
@@ -424,6 +442,7 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, int64(s.cfg.maxDoc)*2+1024) // marge pour l'échappement JSON
 	var body struct {
 		T string `json:"t"`
+		L string `json:"l"`
 		F string `json:"f"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -439,11 +458,11 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "document trop gros", http.StatusRequestEntityTooLarge)
 		return
 	}
-	if !clientRe.MatchString(body.F) {
-		http.Error(w, "identifiant client invalide", http.StatusBadRequest)
+	if !clientRe.MatchString(body.F) || !langRe.MatchString(body.L) {
+		http.Error(w, "requête invalide", http.StatusBadRequest)
 		return
 	}
-	v, err := s.st.put(id, body.T, body.F)
+	v, err := s.st.put(id, body.T, body.L, body.F)
 	switch {
 	case errors.Is(err, errNotFound):
 		http.Error(w, err.Error(), http.StatusNotFound)
@@ -462,7 +481,7 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
-		h.Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+		h.Set("Content-Security-Policy", fmt.Sprintf(csp, ""))
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Robots-Tag", "noindex, nofollow")
@@ -474,23 +493,63 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
+// handleStatic sert les fichiers web. Avec ?v=<version courante>, la réponse
+// est mise en cache un an (l'URL change à chaque nouvelle version). Si une
+// variante .gz a été générée au build, elle est servie aux navigateurs qui
+// acceptent gzip.
+func (s *server) handleStatic(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("file")
+	if !fs.ValidPath(name) || strings.HasSuffix(name, ".gz") || name == "index.html" {
+		http.NotFound(w, r)
+		return
+	}
+	h := w.Header()
+	if r.URL.Query().Get("v") == s.version {
+		h.Set("Cache-Control", "public, max-age=31536000, immutable")
+	} else {
+		h.Set("Cache-Control", "no-cache")
+	}
+	h.Set("Vary", "Accept-Encoding")
+	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		if gz, err := fs.ReadFile(s.static, name+".gz"); err == nil {
+			h.Set("Content-Type", mime.TypeByExtension(path.Ext(name)))
+			h.Set("Content-Encoding", "gzip")
+			http.ServeContent(w, r, name, time.Time{}, bytes.NewReader(gz))
+			return
+		}
+	}
+	http.ServeFileFS(w, r, s.static, name)
+}
+
 func (s *server) routes() (http.Handler, error) {
-	static, err := fs.Sub(webFS, "web")
+	var err error
+	if s.static, err = fs.Sub(webFS, "web"); err != nil {
+		return nil, err
+	}
+	sum := sha256.New()
+	err = fs.WalkDir(s.static, ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		b, err := fs.ReadFile(s.static, p)
+		sum.Write([]byte(p))
+		sum.Write(b)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
-	if s.index, err = fs.ReadFile(static, "index.html"); err != nil {
+	s.version = hex.EncodeToString(sum.Sum(nil))[:12]
+	index, err := fs.ReadFile(s.static, "index.html")
+	if err != nil {
 		return nil, err
 	}
-	files := http.StripPrefix("/static/", http.FileServerFS(static))
+	s.index = bytes.ReplaceAll(index, []byte("__V__"), []byte(s.version))
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.handleNew)
 	mux.HandleFunc("GET /{id}", s.handleIndex)
-	mux.Handle("GET /static/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "no-cache")
-		files.ServeHTTP(w, r)
-	}))
+	mux.HandleFunc("GET /static/{file...}", s.handleStatic)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
 	mux.HandleFunc("GET /api/rooms/{id}/events", s.handleEvents)
 	mux.HandleFunc("PUT /api/rooms/{id}", s.handlePut)

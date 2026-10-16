@@ -4,6 +4,8 @@ WORKDIR /src
 COPY go.mod ./
 COPY main.go ./
 COPY web ./web
+# Pré-compression : le serveur sert editor.js.gz aux navigateurs qui acceptent gzip.
+RUN gzip -9 -k web/editor.js
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/zedcode .
 
 # --- runtime : image vide, utilisateur non-root, aucune écriture disque ---

@@ -7,11 +7,15 @@ Go, bibliothèque standard uniquement (zéro dépendance), image Docker `scratch
 
 - `https://code.zedxp.com` → crée une salle et redirige vers `https://code.zedxp.com/aB3x9Z`.
 - Sur l'autre PC : tape `code.zedxp.com/aB3x9Z`, ou saisis le code dans « Rejoindre ».
-- Boutons :
-  - **Rejoindre** : ouvre la salle dont tu as tapé le code ;
+- Barre d'outils :
+  - **code de salle** (en haut à gauche) : un clic copie le lien ;
+  - **langage** : coloration syntaxique (SQL, Java, Bash, Python, Go…), partagé par tous les appareils de la salle ;
+  - **Code → flèche** : rejoindre une autre salle ;
+  - **Télécharger** : enregistre le contenu avec la bonne extension (`.sql`, `.java`…) ;
   - **Nouvelle salle** : crée une salle vide ;
-  - **Copier le lien** : copie l'URL de la salle ;
-  - **Télécharger** : enregistre le contenu en `.txt`.
+  - **soleil / lune** : thème clair ou sombre (mémorisé par navigateur).
+- Éditeur CodeMirror 6 : numéros de ligne, `Ctrl+D` sélection de l'occurrence suivante,
+  `Alt+clic` multi-curseur, `Ctrl+F` recherche, `Tab` indente.
 
 Code de salle : 6 caractères `[A-Za-z0-9]`, soit 62⁶ = 56 800 235 584 combinaisons, tirés avec `crypto/rand`.
 
@@ -44,6 +48,20 @@ Code de salle : 6 caractères `[A-Za-z0-9]`, soit 62⁶ = 56 800 235 584 combina
 | `MAX_CONNECTIONS` | `200` | Appareils connectés simultanément, toutes salles confondues |
 | `TRUST_PROXY` | `1` (compose) | Lit l'IP client dans `X-Forwarded-For` (uniquement derrière un proxy) |
 
+## Éditeur (web/editor.js)
+
+`web/editor.js` est un fichier **généré** (CodeMirror 6, bundle esbuild) et versionné dans le dépôt :
+le build Docker ne compile que du Go, pas de Node sur le VPS. Source : `editor/src/main.js`.
+
+Après modification de `editor/` :
+
+```sh
+docker run --rm -v "$PWD:/w" -w /w/editor node:22-alpine sh -c "npm ci && npm run build"
+```
+
+Poids : 1,1 Mo brut, environ 386 Ko en gzip (pré-compressé au build Docker), mis en cache un an
+par le navigateur via une URL versionnée (`?v=<empreinte>`).
+
 ## Dev local
 
 ```sh
@@ -64,4 +82,4 @@ docker run --rm -p 8080:8080 zedcode   # http://localhost:8080
 
 - **Dernier écrit gagne** : si deux machines tapent en même temps, l'une écrase l'autre.
 - Document entier renvoyé à chaque modification (debounce 300 ms).
-- Pas de coloration syntaxique (`<textarea>`). Évolution : CodeMirror 6 embarqué.
+- Pas de détection automatique du langage : choix manuel dans la liste.
