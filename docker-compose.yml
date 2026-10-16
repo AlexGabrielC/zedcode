@@ -7,12 +7,14 @@ services:
     expose:
       - "8080"
     environment:
-      ACCESS_TOKEN: ${ACCESS_TOKEN}
-      ROOM_TTL: ${ROOM_TTL:-72h}
+      # Le conteneur n'est joignable que via le proxy : on peut lire l'IP
+      # client dans X-Forwarded-For (pour la limite de débit par IP).
+      TRUST_PROXY: "1"
+      ROOM_TTL: ${ROOM_TTL:-2h}
+      JOIN_PER_MINUTE: ${JOIN_PER_MINUTE:-30}
       MAX_DOC_BYTES: ${MAX_DOC_BYTES:-1048576}
       MAX_TOTAL_BYTES: ${MAX_TOTAL_BYTES:-33554432}
-    volumes:
-      - zedcode-data:/data
+    # Aucun volume : tout vit en RAM, rien ne finit dans une sauvegarde.
     read_only: true
     cap_drop:
       - ALL
@@ -29,6 +31,3 @@ services:
         limits:
           cpus: "0.25"
           memory: 96M
-
-volumes:
-  zedcode-data:

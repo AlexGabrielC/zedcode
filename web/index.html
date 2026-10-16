@@ -10,26 +10,25 @@
 </head>
 <body>
 <header>
-  <a class="brand" href="/">zedcode</a>
+  <a class="brand" href="/" title="Nouvelle salle">zedcode</a>
+  <span id="room" class="room"></span>
   <span id="status" class="status"></span>
   <span id="peers" class="peers"></span>
-  <nav id="actions" hidden>
-    <button id="btn-new" type="button">Nouveau</button>
+  <nav>
+    <form id="join" class="join">
+      <input id="join-code" maxlength="6" pattern="[A-Za-z0-9]{6}" placeholder="code"
+             aria-label="Code de salle à rejoindre" autocomplete="off" spellcheck="false" required>
+      <button type="submit">Rejoindre</button>
+    </form>
+    <a class="button" href="/">Nouvelle salle</a>
     <button id="btn-copy" type="button">Copier le lien</button>
     <button id="btn-download" type="button">Télécharger</button>
-    <button id="btn-logout" type="button">Déconnexion</button>
   </nav>
 </header>
 <main>
-  <form id="login" class="login" hidden>
-    <label for="token">Jeton d'accès</label>
-    <input id="token" type="password" autocomplete="current-password" required>
-    <button type="submit">Entrer</button>
-    <p id="login-error" class="error" hidden></p>
-  </form>
-  <p id="fatal" class="error" hidden></p>
   <textarea id="editor" spellcheck="false" autocapitalize="off" autocomplete="off"
-            aria-label="Éditeur de code" placeholder="Colle ou tape ton code ici…" hidden></textarea>
+            aria-label="Éditeur de code" placeholder="Colle ou tape ton code ici…"></textarea>
 </main>
+<footer>Salle effacée 2 h après la dernière activité. Rien n'est écrit sur disque. Quiconque a le code peut lire : pas de secrets ici.</footer>
 </body>
 </html>

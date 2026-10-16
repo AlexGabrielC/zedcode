@@ -1,29 +1,26 @@
-// zedcode — partage de code temps réel, chiffré de bout en bout.
+// zedcode — partage de code temps réel, façon codeshare, ultra léger.
 //
-// Le serveur ne stocke et ne relaie que des blobs opaques : le navigateur
-// chiffre le texte en AES-256-GCM avec une clé qui vit dans le fragment
-// d'URL (#...), lequel n'est jamais transmis au serveur.
+// Une salle = code.zedxp.com/<6 caractères [A-Za-z0-9]>. Tout vit en RAM :
+// rien n'est écrit sur disque, donc rien ne finit dans une sauvegarde.
+// Une salle disparaît après ROOM_TTL sans activité.
 package main
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"crypto/subtle"
+	"crypto/rand"
 	"embed"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"math/big"
 	"mime"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -35,27 +32,28 @@ import (
 //go:embed web
 var webFS embed.FS
 
+const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
 var (
-	roomRe   = regexp.MustCompile(`^[A-Za-z0-9_-]{16,64}$`)
+	roomRe   = regexp.MustCompile(`^[A-Za-z0-9]{6}$`)
 	clientRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,32}$`)
 
-	errFull     = errors.New("quota de stockage atteint")
+	errFull     = errors.New("quota mémoire atteint")
 	errTooMany  = errors.New("trop de salles ou de connexions")
-	sessionName = "zc_session"
+	errNotFound = errors.New("salle inconnue")
 )
 
 // ---------------------------------------------------------------- config
 
 type config struct {
-	addr         string
-	token        string
-	dataDir      string
-	roomTTL      time.Duration
-	maxDoc       int
-	maxTotal     int
-	maxRooms     int
-	maxSubs      int
-	cookieSecure bool
+	addr          string
+	roomTTL       time.Duration
+	maxDoc        int
+	maxTotal      int
+	maxRooms      int
+	maxSubs       int
+	joinPerMinute int
+	trustProxy    bool
 }
 
 func envOr(k, def string) string {
@@ -79,13 +77,11 @@ func envInt(k string, def int) (int, error) {
 
 func loadConfig() (config, error) {
 	c := config{
-		addr:         envOr("ADDR", ":8080"),
-		token:        os.Getenv("ACCESS_TOKEN"),
-		dataDir:      os.Getenv("DATA_DIR"),
-		cookieSecure: os.Getenv("COOKIE_INSECURE") != "1",
+		addr:       envOr("ADDR", ":8080"),
+		trustProxy: os.Getenv("TRUST_PROXY") == "1",
 	}
 	var err error
-	if c.roomTTL, err = time.ParseDuration(envOr("ROOM_TTL", "72h")); err != nil {
+	if c.roomTTL, err = time.ParseDuration(envOr("ROOM_TTL", "2h")); err != nil {
 		return c, fmt.Errorf("ROOM_TTL: %w", err)
 	}
 	for _, x := range []struct {
@@ -97,16 +93,11 @@ func loadConfig() (config, error) {
 		{"MAX_TOTAL_BYTES", &c.maxTotal, 32 << 20},
 		{"MAX_ROOMS", &c.maxRooms, 500},
 		{"MAX_CONNECTIONS", &c.maxSubs, 200},
+		{"JOIN_PER_MINUTE", &c.joinPerMinute, 30},
 	} {
 		if *x.dst, err = envInt(x.k, x.def); err != nil {
 			return c, err
 		}
-	}
-	switch {
-	case c.token == "" && os.Getenv("INSECURE_NO_AUTH") == "1":
-		slog.Warn("authentification désactivée (INSECURE_NO_AUTH=1)")
-	case len(c.token) < 16:
-		return c, errors.New("ACCESS_TOKEN manquant ou trop court (16 caractères min). Génère-le avec : openssl rand -hex 32")
 	}
 	return c, nil
 }
@@ -115,14 +106,8 @@ func loadConfig() (config, error) {
 
 type event struct {
 	V uint64 `json:"v"`
-	D string `json:"d"`
+	T string `json:"t"`
 	F string `json:"f,omitempty"`
-}
-
-type persisted struct {
-	V uint64 `json:"v"`
-	D string `json:"d"`
-	T int64  `json:"t"`
 }
 
 type sub struct {
@@ -142,17 +127,10 @@ type store struct {
 	rooms map[string]*room
 	total int
 	nsubs int
-	dirty map[string]struct{}
-	gone  map[string]struct{}
 }
 
 func newStore(cfg config) *store {
-	return &store{
-		cfg:   cfg,
-		rooms: map[string]*room{},
-		dirty: map[string]struct{}{},
-		gone:  map[string]struct{}{},
-	}
+	return &store{cfg: cfg, rooms: map[string]*room{}}
 }
 
 // offer envoie v sans bloquer ; si le canal est plein, la valeur en attente
@@ -173,16 +151,11 @@ func offer[T any](ch chan T, v T) {
 	}
 }
 
-func (s *store) roomLocked(id string) (*room, error) {
-	if r, ok := s.rooms[id]; ok {
-		return r, nil
-	}
-	if len(s.rooms) >= s.cfg.maxRooms {
-		return nil, errTooMany
-	}
-	r := &room{updated: time.Now(), subs: map[*sub]struct{}{}}
-	s.rooms[id] = r
-	return r, nil
+func (s *store) exists(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.rooms[id]
+	return ok
 }
 
 func (s *store) presenceLocked(r *room) {
@@ -191,15 +164,22 @@ func (s *store) presenceLocked(r *room) {
 	}
 }
 
+// subscribe ouvre (et crée au besoin) une salle. C'est la seule façon de
+// créer une salle : un PUT sur une salle inconnue est refusé, ce qui force
+// tout balayage de codes à passer par le limiteur de débit.
 func (s *store) subscribe(id string) (*sub, event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.nsubs >= s.cfg.maxSubs {
 		return nil, event{}, errTooMany
 	}
-	r, err := s.roomLocked(id)
-	if err != nil {
-		return nil, event{}, err
+	r, ok := s.rooms[id]
+	if !ok {
+		if len(s.rooms) >= s.cfg.maxRooms {
+			return nil, event{}, errTooMany
+		}
+		r = &room{updated: time.Now(), subs: map[*sub]struct{}{}}
+		s.rooms[id] = r
 	}
 	sb := &sub{doc: make(chan event, 1), presence: make(chan int, 1)}
 	r.subs[sb] = struct{}{}
@@ -221,24 +201,23 @@ func (s *store) unsubscribe(id string, sb *sub) {
 		delete(s.rooms, id) // salle jamais écrite : rien à garder
 		return
 	}
+	r.updated = time.Now() // le départ du dernier appareil compte comme activité
 	s.presenceLocked(r)
 }
 
-func (s *store) put(id, data, from string) (uint64, error) {
+func (s *store) put(id, text, from string) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	r, err := s.roomLocked(id)
-	if err != nil {
-		return 0, err
+	r, ok := s.rooms[id]
+	if !ok {
+		return 0, errNotFound
 	}
-	if s.total-len(r.ev.D)+len(data) > s.cfg.maxTotal {
+	if s.total-len(r.ev.T)+len(text) > s.cfg.maxTotal {
 		return 0, errFull
 	}
-	s.total += len(data) - len(r.ev.D)
-	r.ev = event{V: r.ev.V + 1, D: data, F: from}
+	s.total += len(text) - len(r.ev.T)
+	r.ev = event{V: r.ev.V + 1, T: text, F: from}
 	r.updated = time.Now()
-	s.dirty[id] = struct{}{}
-	delete(s.gone, id)
 	for sb := range r.subs {
 		offer(sb.doc, r.ev)
 	}
@@ -250,114 +229,61 @@ func (s *store) expire(now time.Time) {
 	defer s.mu.Unlock()
 	for id, r := range s.rooms {
 		if len(r.subs) == 0 && now.Sub(r.updated) > s.cfg.roomTTL {
-			s.total -= len(r.ev.D)
+			s.total -= len(r.ev.T)
 			delete(s.rooms, id)
-			delete(s.dirty, id)
-			s.gone[id] = struct{}{}
 		}
 	}
 }
 
-func (s *store) path(id string) string { return filepath.Join(s.cfg.dataDir, id+".json") }
+// --------------------------------------------------------------- limiter
 
-// flush écrit les salles modifiées sur disque. Appelée depuis une seule
-// goroutine : pas de course entre écritures concurrentes d'un même fichier.
-func (s *store) flush() {
-	if s.cfg.dataDir == "" {
-		return
-	}
-	s.mu.Lock()
-	writes := make(map[string]persisted, len(s.dirty))
-	for id := range s.dirty {
-		if r, ok := s.rooms[id]; ok {
-			writes[id] = persisted{V: r.ev.V, D: r.ev.D, T: r.updated.Unix()}
-		}
-	}
-	dels := s.gone
-	s.dirty = map[string]struct{}{}
-	s.gone = map[string]struct{}{}
-	s.mu.Unlock()
+// limiter : seau à jetons par IP, pour l'ouverture de salles.
+type limiter struct {
+	mu      sync.Mutex
+	rate    float64 // jetons par seconde
+	burst   float64
+	buckets map[string]*bucket
+}
 
-	for id, p := range writes {
-		if err := writeAtomic(s.path(id), p); err != nil {
-			slog.Error("écriture salle", "room", id, "err", err)
-		}
-	}
-	for id := range dels {
-		if err := os.Remove(s.path(id)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			slog.Error("suppression salle", "room", id, "err", err)
-		}
+type bucket struct {
+	tokens float64
+	last   time.Time
+}
+
+func newLimiter(perMinute int) *limiter {
+	return &limiter{
+		rate:    float64(perMinute) / 60,
+		burst:   float64(perMinute),
+		buckets: map[string]*bucket{},
 	}
 }
 
-func writeAtomic(path string, v any) error {
-	f, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
-	if err != nil {
-		return err
+func (l *limiter) allow(ip string, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b, ok := l.buckets[ip]
+	if !ok {
+		if len(l.buckets) >= 10000 {
+			l.buckets = map[string]*bucket{} // borne la mémoire
+		}
+		b = &bucket{tokens: l.burst, last: now}
+		l.buckets[ip] = b
 	}
-	defer os.Remove(f.Name())
-	if err := json.NewEncoder(f).Encode(v); err != nil {
-		f.Close()
-		return err
+	b.tokens = min(l.burst, b.tokens+now.Sub(b.last).Seconds()*l.rate)
+	b.last = now
+	if b.tokens < 1 {
+		return false
 	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(f.Name(), path)
+	b.tokens--
+	return true
 }
 
-func (s *store) load() error {
-	if s.cfg.dataDir == "" {
-		return nil
-	}
-	if err := os.MkdirAll(s.cfg.dataDir, 0o700); err != nil {
-		return err
-	}
-	entries, err := os.ReadDir(s.cfg.dataDir)
-	if err != nil {
-		return err
-	}
-	now := time.Now()
-	for _, e := range entries {
-		id, ok := strings.CutSuffix(e.Name(), ".json")
-		if !ok || !roomRe.MatchString(id) {
-			continue
-		}
-		b, err := os.ReadFile(s.path(id))
-		if err != nil {
-			return err
-		}
-		var p persisted
-		if err := json.Unmarshal(b, &p); err != nil {
-			slog.Warn("fichier de salle illisible, ignoré", "room", id, "err", err)
-			continue
-		}
-		updated := time.Unix(p.T, 0)
-		if now.Sub(updated) > s.cfg.roomTTL {
-			os.Remove(s.path(id))
-			continue
-		}
-		s.rooms[id] = &room{ev: event{V: p.V, D: p.D}, updated: updated, subs: map[*sub]struct{}{}}
-		s.total += len(p.D)
-	}
-	slog.Info("salles chargées", "count", len(s.rooms), "bytes", s.total)
-	return nil
-}
-
-func (s *store) run(ctx context.Context) {
-	flushT := time.NewTicker(2 * time.Second)
-	expireT := time.NewTicker(time.Minute)
-	defer flushT.Stop()
-	defer expireT.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			s.flush()
-			return
-		case <-flushT.C:
-			s.flush()
-		case now := <-expireT.C:
-			s.expire(now)
+func (l *limiter) prune(now time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for ip, b := range l.buckets {
+		if now.Sub(b.last) > 10*time.Minute {
+			delete(l.buckets, ip)
 		}
 	}
 }
@@ -365,89 +291,64 @@ func (s *store) run(ctx context.Context) {
 // ---------------------------------------------------------------- server
 
 type server struct {
-	cfg     config
-	st      *store
-	session string // valeur attendue du cookie de session
-	index   []byte
+	cfg   config
+	st    *store
+	lim   *limiter
+	index []byte
 }
 
-func (s *server) authed(r *http.Request) bool {
-	if s.cfg.token == "" {
-		return true
-	}
-	c, err := r.Cookie(sessionName)
-	return err == nil && subtle.ConstantTimeCompare([]byte(c.Value), []byte(s.session)) == 1
-}
-
-func (s *server) auth(h http.HandlerFunc) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.authed(r) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
+// clientIP : derrière le proxy de Coolify (Traefik/Caddy), l'IP réelle est
+// la dernière entrée de X-Forwarded-For, ajoutée par le proxy lui-même.
+func (s *server) clientIP(r *http.Request) string {
+	if s.cfg.trustProxy {
+		if vals := r.Header.Values("X-Forwarded-For"); len(vals) > 0 {
+			parts := strings.Split(vals[len(vals)-1], ",")
+			if ip := strings.TrimSpace(parts[len(parts)-1]); ip != "" {
+				return ip
+			}
 		}
-		h(w, r)
-	})
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
-// isJSON impose application/json sur les écritures : un formulaire
-// cross-site ne peut pas l'envoyer sans requête preflight CORS.
+func genCode() string {
+	b := make([]byte, 6)
+	for i := range b {
+		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(alphabet))))
+		if err != nil {
+			panic(err)
+		}
+		b[i] = alphabet[n.Int64()]
+	}
+	return string(b)
+}
+
 func isJSON(r *http.Request) bool {
 	mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	return mt == "application/json"
 }
 
+func (s *server) handleNew(w http.ResponseWriter, r *http.Request) {
+	code := genCode()
+	for i := 0; i < 10 && s.st.exists(code); i++ {
+		code = genCode()
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	http.Redirect(w, r, "/"+code, http.StatusFound)
+}
+
 func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	if id := r.PathValue("id"); id != "" && !roomRe.MatchString(id) {
+	if !roomRe.MatchString(r.PathValue("id")) {
 		http.NotFound(w, r)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Write(s.index)
-}
-
-func (s *server) handleMe(w http.ResponseWriter, r *http.Request) {
-	if !s.authed(r) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
-	if !isJSON(r) {
-		http.Error(w, "application/json requis", http.StatusUnsupportedMediaType)
-		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, 4096)
-	var body struct {
-		Token string `json:"token"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, "requête invalide", http.StatusBadRequest)
-		return
-	}
-	// Comparaison de condensats : longueur fixe, temps constant.
-	got, want := sha256.Sum256([]byte(body.Token)), sha256.Sum256([]byte(s.cfg.token))
-	if s.cfg.token == "" || subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
-		time.Sleep(time.Second) // freine le brute-force
-		http.Error(w, "jeton invalide", http.StatusUnauthorized)
-		return
-	}
-	http.SetCookie(w, &http.Cookie{
-		Name: sessionName, Value: s.session, Path: "/",
-		MaxAge: 30 * 24 * 3600, HttpOnly: true, Secure: s.cfg.cookieSecure,
-		SameSite: http.SameSiteStrictMode,
-	})
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (s *server) handleLogout(w http.ResponseWriter, r *http.Request) {
-	http.SetCookie(w, &http.Cookie{
-		Name: sessionName, Value: "", Path: "/", MaxAge: -1,
-		HttpOnly: true, Secure: s.cfg.cookieSecure, SameSite: http.SameSiteStrictMode,
-	})
-	w.WriteHeader(http.StatusNoContent)
 }
 
 func writeSSE(w http.ResponseWriter, name string, v any) error {
@@ -463,6 +364,10 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !roomRe.MatchString(id) {
 		http.NotFound(w, r)
+		return
+	}
+	if !s.lim.allow(s.clientIP(r), time.Now()) {
+		http.Error(w, "trop de tentatives, réessaie dans une minute", http.StatusTooManyRequests)
 		return
 	}
 	sb, snap, err := s.st.subscribe(id)
@@ -516,9 +421,9 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "application/json requis", http.StatusUnsupportedMediaType)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, int64(s.cfg.maxDoc)+1024)
+	r.Body = http.MaxBytesReader(w, r.Body, int64(s.cfg.maxDoc)*2+1024) // marge pour l'échappement JSON
 	var body struct {
-		D string `json:"d"`
+		T string `json:"t"`
 		F string `json:"f"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -530,7 +435,7 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "requête invalide", http.StatusBadRequest)
 		return
 	}
-	if len(body.D) > s.cfg.maxDoc {
+	if len(body.T) > s.cfg.maxDoc {
 		http.Error(w, "document trop gros", http.StatusRequestEntityTooLarge)
 		return
 	}
@@ -538,8 +443,11 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "identifiant client invalide", http.StatusBadRequest)
 		return
 	}
-	v, err := s.st.put(id, body.D, body.F)
+	v, err := s.st.put(id, body.T, body.F)
 	switch {
+	case errors.Is(err, errNotFound):
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
 	case errors.Is(err, errFull):
 		http.Error(w, err.Error(), http.StatusInsufficientStorage)
 		return
@@ -557,6 +465,7 @@ func securityHeaders(next http.Handler) http.Handler {
 		h.Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Robots-Tag", "noindex, nofollow")
 		h.Set("Cross-Origin-Opener-Policy", "same-origin")
 		h.Set("Cross-Origin-Resource-Policy", "same-origin")
 		h.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
@@ -576,18 +485,15 @@ func (s *server) routes() (http.Handler, error) {
 	files := http.StripPrefix("/static/", http.FileServerFS(static))
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", s.handleIndex)
-	mux.HandleFunc("GET /r/{id}", s.handleIndex)
+	mux.HandleFunc("GET /{$}", s.handleNew)
+	mux.HandleFunc("GET /{id}", s.handleIndex)
 	mux.Handle("GET /static/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-cache")
 		files.ServeHTTP(w, r)
 	}))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
-	mux.HandleFunc("GET /api/me", s.handleMe)
-	mux.HandleFunc("POST /api/login", s.handleLogin)
-	mux.HandleFunc("POST /api/logout", s.handleLogout)
-	mux.Handle("GET /api/rooms/{id}/events", s.auth(s.handleEvents))
-	mux.Handle("PUT /api/rooms/{id}", s.auth(s.handlePut))
+	mux.HandleFunc("GET /api/rooms/{id}/events", s.handleEvents)
+	mux.HandleFunc("PUT /api/rooms/{id}", s.handlePut)
 	return securityHeaders(mux), nil
 }
 
@@ -623,15 +529,7 @@ func main() {
 		slog.Error("configuration", "err", err)
 		os.Exit(1)
 	}
-	st := newStore(cfg)
-	if err := st.load(); err != nil {
-		slog.Error("chargement des données", "err", err)
-		os.Exit(1)
-	}
-
-	mac := hmac.New(sha256.New, []byte(cfg.token))
-	mac.Write([]byte("zedcode-session-v1"))
-	srv := &server{cfg: cfg, st: st, session: hex.EncodeToString(mac.Sum(nil))}
+	srv := &server{cfg: cfg, st: newStore(cfg), lim: newLimiter(cfg.joinPerMinute)}
 	handler, err := srv.routes()
 	if err != nil {
 		slog.Error("routes", "err", err)
@@ -653,12 +551,22 @@ func main() {
 		BaseContext:       func(net.Listener) context.Context { return baseCtx },
 	}
 
-	storeDone := make(chan struct{})
-	storeCtx, stopStore := context.WithCancel(context.Background())
-	go func() { st.run(storeCtx); close(storeDone) }()
+	go func() {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-t.C:
+				srv.st.expire(now)
+				srv.lim.prune(now)
+			}
+		}
+	}()
 
 	go func() {
-		slog.Info("zedcode démarré", "addr", cfg.addr, "persistence", cfg.dataDir != "", "auth", cfg.token != "")
+		slog.Info("zedcode démarré", "addr", cfg.addr, "ttl", cfg.roomTTL, "trust_proxy", cfg.trustProxy)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("serveur HTTP", "err", err)
 			stop()
@@ -671,6 +579,4 @@ func main() {
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutCtx)
-	stopStore()
-	<-storeDone
 }
