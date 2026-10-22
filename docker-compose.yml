@@ -13,6 +13,8 @@ services:
       ROOM_TTL: ${ROOM_TTL:-2h}
       JOIN_PER_MINUTE: ${JOIN_PER_MINUTE:-30}
       MAX_DOC_BYTES: ${MAX_DOC_BYTES:-1048576}
+      MAX_FILE_BYTES: ${MAX_FILE_BYTES:-26214400}
+      # Textes + fichiers. Rester bien sous la limite mémoire du conteneur (96M).
       MAX_TOTAL_BYTES: ${MAX_TOTAL_BYTES:-33554432}
     # Aucun volume : tout vit en RAM, rien ne finit dans une sauvegarde.
     read_only: true

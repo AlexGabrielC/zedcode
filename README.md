@@ -12,6 +12,10 @@ image Docker `scratch` d'environ 12 Mo, environ 3 Mo de RAM au repos.
   - **code de salle** (en haut à gauche) : un clic copie le lien ;
   - **langage** : coloration syntaxique (SQL, Java, Bash, Python, Go…), partagé par tous les appareils de la salle ;
   - **Code → flèche** : rejoindre une autre salle ;
+  - **Fichier** : partage un fichier dans la salle (aussi par glisser-déposer sur la page,
+    ou en collant une capture d'écran). **Un seul fichier par salle** : le dernier envoyé
+    remplace le précédent. Il apparaît sous la barre sur tous les appareils : clic pour
+    télécharger, croix pour retirer ;
   - **Télécharger** : enregistre le contenu avec la bonne extension (`.sql`, `.java`…) ;
   - **Nouvelle salle** : crée une salle vide ;
   - **soleil / lune** : thème clair ou sombre (mémorisé par navigateur).
@@ -26,6 +30,11 @@ Code de salle : 6 caractères `[A-Za-z0-9]`, soit 62⁶ = 56 800 235 584 combina
 - **Tout est en RAM** : rien sur disque, donc rien dans les sauvegardes Coolify/OVH.
   Un redéploiement vide les salles ; un onglet encore ouvert renvoie alors son contenu.
 - Une salle est effacée `ROOM_TTL` (2 h) après la dernière activité (modification ou départ du dernier appareil), si plus personne n'est connecté.
+- Fichiers : `POST /api/rooms/<code>/files?name=…` (corps brut), servis en téléchargement forcé
+  (`Content-Disposition: attachment`, `application/octet-stream`, CSP `sandbox`) : un fichier HTML
+  ou SVG déposé ne s'exécute jamais dans la page. Le quota est réservé avant la lecture du corps,
+  un seul envoi à la fois par salle (409 sinon). L'ancien fichier reste téléchargeable pendant
+  l'envoi du nouveau : au pire, la RAM des fichiers atteint brièvement 2 × `MAX_TOTAL_BYTES`.
 - Ouvrir une salle est limité à `JOIN_PER_MINUTE` (30) par IP : balayer les codes au hasard
   demanderait des milliards de requêtes. Un PUT sur une salle non ouverte est refusé (404).
 
@@ -44,7 +53,8 @@ Code de salle : 6 caractères `[A-Za-z0-9]`, soit 62⁶ = 56 800 235 584 combina
 | `ROOM_TTL` | `2h` | Durée de vie d'une salle inactive |
 | `JOIN_PER_MINUTE` | `30` | Ouvertures de salle max par IP et par minute |
 | `MAX_DOC_BYTES` | `1048576` | Taille max d'un document (octets) |
-| `MAX_TOTAL_BYTES` | `33554432` | Quota total des documents en mémoire (octets) |
+| `MAX_FILE_BYTES` | `26214400` | Taille max du fichier partagé (25 Mo) |
+| `MAX_TOTAL_BYTES` | `33554432` | Quota total en mémoire, textes **et fichiers** (octets) |
 | `MAX_ROOMS` | `500` | Nombre max de salles |
 | `MAX_CONNECTIONS` | `200` | Appareils connectés simultanément, toutes salles confondues |
 | `TRUST_PROXY` | `1` (compose) | Lit l'IP client dans `X-Forwarded-For` (uniquement derrière un proxy) |
@@ -84,3 +94,6 @@ docker run --rm -p 8080:8080 zedcode   # http://localhost:8080
 - **Dernier écrit gagne** : si deux machines tapent en même temps, l'une écrase l'autre.
 - Document entier renvoyé à chaque modification (debounce 300 ms).
 - Pas de détection automatique du langage : choix manuel dans la liste.
+- Un redéploiement efface les fichiers (contrairement au texte, un onglet ouvert ne les renvoie pas).
+- Le quota est global : quelqu'un qui remplit `MAX_TOTAL_BYTES` bloque les envois de tout le monde
+  jusqu'à expiration de ses salles.

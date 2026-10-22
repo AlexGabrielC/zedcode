@@ -83,6 +83,7 @@
       }
     };
     es.addEventListener("doc", (e) => onDoc(JSON.parse(e.data)));
+    es.addEventListener("files", (e) => renderFiles(JSON.parse(e.data)));
     es.addEventListener("presence", (e) => {
       const { n } = JSON.parse(e.data);
       $("peers").textContent = n > 1 ? `${n} appareils` : "seul ici";
@@ -125,6 +126,137 @@
     }
   }
 
+  // ---------- fichiers ----------
+  const maxFile = Number(document.querySelector('meta[name="max-file"]').content) || 0;
+  const icon = (d) => `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${d}"/></svg>`;
+
+  function fmtSize(n) {
+    if (n < 1024) return `${n} o`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10240 ? 1 : 0)} Ko`;
+    return `${(n / 1048576).toFixed(1)} Mo`;
+  }
+
+  function renderFiles(list) {
+    const ul = $("files");
+    ul.replaceChildren(...list.map((f) => {
+      const li = document.createElement("li");
+      li.className = "file";
+      const a = document.createElement("a");
+      a.href = `/api/rooms/${roomId}/files/${f.id}`;
+      a.download = f.name;
+      a.title = `Télécharger ${f.name}`;
+      a.innerHTML = icon("M12 4v11M7 10l5 5 5-5M5 20h14") + '<span class="name"></span><span class="size"></span>';
+      a.querySelector(".name").textContent = f.name;
+      a.querySelector(".size").textContent = fmtSize(f.size);
+      const del = document.createElement("button");
+      del.type = "button";
+      del.title = `Retirer ${f.name} de la salle`;
+      del.setAttribute("aria-label", del.title);
+      del.innerHTML = icon("M6 6l12 12M18 6L6 18");
+      del.addEventListener("click", () => removeFile(f, li));
+      li.append(a, del);
+      return li;
+    }));
+    ul.hidden = list.length === 0;
+  }
+
+  async function removeFile(f, li) {
+    li.classList.add("pending");
+    try {
+      const res = await fetch(`/api/rooms/${roomId}/files/${f.id}`, { method: "DELETE" });
+      if (!res.ok && res.status !== 404) throw new Error((await res.text()).trim());
+    } catch (e) {
+      li.classList.remove("pending");
+      setStatus(`suppression impossible : ${e.message}`, "err");
+    }
+    // En cas de succès, la liste arrive par l'événement "files".
+  }
+
+  function sendFile(f) {
+    return new Promise((resolve) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", `/api/rooms/${roomId}/files?name=${encodeURIComponent(f.name)}`);
+      xhr.setRequestHeader("Content-Type", "application/octet-stream");
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) setStatus(`envoi de ${f.name} : ${Math.round(e.loaded / e.total * 100)} %`, "warn");
+      };
+      xhr.onload = () => {
+        if (xhr.status === 200) setStatus(`${f.name} partagé`, "ok");
+        else setStatus(`${f.name} : erreur ${xhr.status} : ${xhr.responseText.trim()}`, "err");
+        resolve(xhr.status === 200);
+      };
+      xhr.onerror = () => { setStatus(`${f.name} : envoi échoué`, "err"); resolve(false); };
+      xhr.send(f);
+    });
+  }
+
+  // Un seul fichier par salle : le nouveau remplace l'actuel pour tout le monde.
+  let uploading = false;
+  async function upload(files) {
+    const f = files[0];
+    if (!f || uploading) return;
+    if (maxFile && f.size > maxFile) {
+      setStatus(`${f.name} : trop gros (max ${fmtSize(maxFile)})`, "err");
+      return;
+    }
+    uploading = true;
+    $("btn-upload").classList.add("busy");
+    try {
+      await sendFile(f);
+      if (files.length > 1) setStatus(`${f.name} partagé (un seul fichier par salle)`, "warn");
+    } finally {
+      uploading = false;
+      $("btn-upload").classList.remove("busy");
+    }
+  }
+
+  $("btn-upload").addEventListener("click", () => $("file-input").click());
+  $("file-input").addEventListener("change", (e) => {
+    upload(e.target.files);
+    e.target.value = "";
+  });
+
+  // Glisser-déposer sur toute la page. Écouteurs en capture sur window : sans
+  // ça, CodeMirror insérerait le contenu du fichier comme texte.
+  const hasFiles = (e) => e.dataTransfer && Array.from(e.dataTransfer.types).includes("Files");
+  let dragDepth = 0;
+  window.addEventListener("dragenter", (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    dragDepth++;
+    $("drop").hidden = false;
+  }, true);
+  window.addEventListener("dragleave", (e) => {
+    if (!hasFiles(e)) return;
+    if (--dragDepth <= 0) { dragDepth = 0; $("drop").hidden = true; }
+  }, true);
+  window.addEventListener("dragover", (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = "copy";
+  }, true);
+  window.addEventListener("drop", (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dragDepth = 0;
+    $("drop").hidden = true;
+    upload(e.dataTransfer.files);
+  }, true);
+
+  // Coller une capture d'écran ou un fichier copié : partagé comme fichier.
+  // Si le presse-papiers contient aussi du texte (copie depuis Word, Excel…),
+  // le texte l'emporte et va dans l'éditeur.
+  window.addEventListener("paste", (e) => {
+    const cd = e.clipboardData;
+    if (!cd || !cd.files.length || cd.types.includes("text/plain")) return;
+    const files = cd.files;
+    e.preventDefault();
+    e.stopPropagation();
+    upload(files);
+  }, true);
+
   // ---------- actions ----------
   $("join").addEventListener("submit", (e) => {
     e.preventDefault();
@@ -152,7 +284,7 @@
   });
 
   window.addEventListener("beforeunload", (e) => {
-    if (hasPending()) e.preventDefault();
+    if (hasPending() || uploading) e.preventDefault();
   });
 
   editor.focus();

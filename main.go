@@ -17,6 +17,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"math/big"
@@ -32,6 +33,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 //go:embed web
@@ -43,10 +46,13 @@ var (
 	roomRe   = regexp.MustCompile(`^[A-Za-z0-9]{6}$`)
 	clientRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,32}$`)
 	langRe   = regexp.MustCompile(`^[a-z0-9]{0,16}$`)
+	fileRe   = regexp.MustCompile(`^[A-Za-z0-9]{10}$`)
 
 	errFull     = errors.New("quota mémoire atteint")
 	errTooMany  = errors.New("trop de salles ou de connexions")
 	errNotFound = errors.New("salle inconnue")
+	errNoFile   = errors.New("fichier inconnu")
+	errBusy     = errors.New("un envoi de fichier est déjà en cours dans cette salle")
 )
 
 // ---------------------------------------------------------------- config
@@ -55,6 +61,7 @@ type config struct {
 	addr          string
 	roomTTL       time.Duration
 	maxDoc        int
+	maxFile       int
 	maxTotal      int
 	maxRooms      int
 	maxSubs       int
@@ -96,6 +103,7 @@ func loadConfig() (config, error) {
 		def int
 	}{
 		{"MAX_DOC_BYTES", &c.maxDoc, 1 << 20},
+		{"MAX_FILE_BYTES", &c.maxFile, 25 << 20},
 		{"MAX_TOTAL_BYTES", &c.maxTotal, 32 << 20},
 		{"MAX_ROOMS", &c.maxRooms, 500},
 		{"MAX_CONNECTIONS", &c.maxSubs, 200},
@@ -117,15 +125,51 @@ type event struct {
 	F string `json:"f,omitempty"`
 }
 
+// fileInfo : ce que les appareils voient d'un fichier (pas son contenu).
+type fileInfo struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Size int    `json:"size"`
+}
+
+type file struct {
+	fileInfo
+	data []byte // jamais modifié après l'ajout : lisible hors verrou
+}
+
 type sub struct {
 	doc      chan event
 	presence chan int
+	files    chan []fileInfo
 }
 
+// Une salle porte au plus un fichier : le dernier envoyé remplace le précédent.
 type room struct {
-	ev      event
-	updated time.Time
-	subs    map[*sub]struct{}
+	ev        event
+	file      *file
+	uploading bool // un envoi à la fois par salle
+	updated   time.Time
+	subs      map[*sub]struct{}
+}
+
+func (r *room) fileSize() int {
+	if r.file == nil {
+		return 0
+	}
+	return r.file.Size
+}
+
+// fileList : liste de 0 ou 1 élément, format de l'événement SSE "files".
+func (r *room) fileList() []fileInfo {
+	if r.file == nil {
+		return []fileInfo{}
+	}
+	return []fileInfo{r.file.fileInfo}
+}
+
+// size : octets comptés dans le quota global (texte + fichier).
+func (r *room) size() int {
+	return len(r.ev.T) + r.fileSize()
 }
 
 type store struct {
@@ -174,25 +218,25 @@ func (s *store) presenceLocked(r *room) {
 // subscribe ouvre (et crée au besoin) une salle. C'est la seule façon de
 // créer une salle : un PUT sur une salle inconnue est refusé, ce qui force
 // tout balayage de codes à passer par le limiteur de débit.
-func (s *store) subscribe(id string) (*sub, event, error) {
+func (s *store) subscribe(id string) (*sub, event, []fileInfo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.nsubs >= s.cfg.maxSubs {
-		return nil, event{}, errTooMany
+		return nil, event{}, nil, errTooMany
 	}
 	r, ok := s.rooms[id]
 	if !ok {
 		if len(s.rooms) >= s.cfg.maxRooms {
-			return nil, event{}, errTooMany
+			return nil, event{}, nil, errTooMany
 		}
 		r = &room{updated: time.Now(), subs: map[*sub]struct{}{}}
 		s.rooms[id] = r
 	}
-	sb := &sub{doc: make(chan event, 1), presence: make(chan int, 1)}
+	sb := &sub{doc: make(chan event, 1), presence: make(chan int, 1), files: make(chan []fileInfo, 1)}
 	r.subs[sb] = struct{}{}
 	s.nsubs++
 	s.presenceLocked(r)
-	return sb, r.ev, nil
+	return sb, r.ev, r.fileList(), nil
 }
 
 func (s *store) unsubscribe(id string, sb *sub) {
@@ -204,7 +248,7 @@ func (s *store) unsubscribe(id string, sb *sub) {
 	}
 	delete(r.subs, sb)
 	s.nsubs--
-	if len(r.subs) == 0 && r.ev.V == 0 {
+	if len(r.subs) == 0 && r.ev.V == 0 && r.file == nil && !r.uploading {
 		delete(s.rooms, id) // salle jamais écrite : rien à garder
 		return
 	}
@@ -231,12 +275,98 @@ func (s *store) put(id, text, lang, from string) (uint64, error) {
 	return r.ev.V, nil
 }
 
+// reserve prend n octets de quota AVANT la lecture d'un fichier, pour que les
+// envois en cours ne puissent pas faire grossir la RAM sans limite. Le fichier
+// actuel de la salle sera remplacé : il est déduit du contrôle, mais reste en
+// mémoire (et téléchargeable) jusqu'à la fin de l'envoi. L'appelant doit
+// ensuite appeler addFile ou release.
+func (s *store) reserve(id string, n int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.rooms[id]
+	if !ok {
+		return errNotFound
+	}
+	if r.uploading {
+		return errBusy
+	}
+	if s.total-r.fileSize()+n > s.cfg.maxTotal {
+		return errFull
+	}
+	s.total += n
+	r.uploading = true
+	return nil
+}
+
+func (s *store) release(id string, n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.total -= n
+	if r, ok := s.rooms[id]; ok {
+		r.uploading = false
+	}
+}
+
+func (s *store) filesChangedLocked(r *room) {
+	r.updated = time.Now()
+	l := r.fileList()
+	for sb := range r.subs {
+		offer(sb.files, l)
+	}
+}
+
+// setFile installe le fichier réservé par reserve, à la place du précédent.
+// Si la salle a disparu entre-temps, la réservation est rendue.
+func (s *store) setFile(id, name string, data []byte) (fileInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.rooms[id]
+	if !ok {
+		s.total -= len(data)
+		return fileInfo{}, errNotFound
+	}
+	s.total -= r.fileSize()
+	r.file = &file{fileInfo: fileInfo{ID: genID(10), Name: name, Size: len(data)}, data: data}
+	r.uploading = false
+	s.filesChangedLocked(r)
+	return r.file.fileInfo, nil
+}
+
+func (s *store) getFile(id, fid string) (*file, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.rooms[id]
+	if !ok {
+		return nil, errNotFound
+	}
+	if r.file == nil || r.file.ID != fid {
+		return nil, errNoFile
+	}
+	return r.file, nil
+}
+
+func (s *store) delFile(id, fid string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.rooms[id]
+	if !ok {
+		return errNotFound
+	}
+	if r.file == nil || r.file.ID != fid {
+		return errNoFile
+	}
+	s.total -= r.file.Size
+	r.file = nil
+	s.filesChangedLocked(r)
+	return nil
+}
+
 func (s *store) expire(now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for id, r := range s.rooms {
 		if len(r.subs) == 0 && now.Sub(r.updated) > s.cfg.roomTTL {
-			s.total -= len(r.ev.T)
+			s.total -= r.size()
 			delete(s.rooms, id)
 		}
 	}
@@ -324,8 +454,10 @@ func (s *server) clientIP(r *http.Request) string {
 	return host
 }
 
-func genCode() string {
-	b := make([]byte, 6)
+func genCode() string { return genID(6) }
+
+func genID(n int) string {
+	b := make([]byte, n)
 	for i := range b {
 		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(alphabet))))
 		if err != nil {
@@ -388,7 +520,7 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "trop de tentatives, réessaie dans une minute", http.StatusTooManyRequests)
 		return
 	}
-	sb, snap, err := s.st.subscribe(id)
+	sb, snap, files, err := s.st.subscribe(id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
@@ -406,6 +538,9 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if err := writeSSE(w, "doc", snap); err != nil {
 		return
 	}
+	if err := writeSSE(w, "files", files); err != nil {
+		return
+	}
 	ping := time.NewTicker(25 * time.Second)
 	defer ping.Stop()
 	for {
@@ -420,6 +555,8 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			err = writeSSE(w, "doc", ev)
 		case n := <-sb.presence:
 			err = writeSSE(w, "presence", map[string]int{"n": n})
+		case l := <-sb.files:
+			err = writeSSE(w, "files", l)
 		case <-ping.C:
 			_, err = fmt.Fprint(w, ": ping\n\n")
 		}
@@ -463,19 +600,124 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	v, err := s.st.put(id, body.T, body.L, body.F)
-	switch {
-	case errors.Is(err, errNotFound):
-		http.Error(w, err.Error(), http.StatusNotFound)
-		return
-	case errors.Is(err, errFull):
-		http.Error(w, err.Error(), http.StatusInsufficientStorage)
-		return
-	case err != nil:
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+	if err != nil {
+		storeErr(w, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]uint64{"v": v})
+}
+
+func storeErr(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, errNotFound), errors.Is(err, errNoFile):
+		http.Error(w, err.Error(), http.StatusNotFound)
+	case errors.Is(err, errFull):
+		http.Error(w, err.Error(), http.StatusInsufficientStorage)
+	case errors.Is(err, errBusy):
+		http.Error(w, err.Error(), http.StatusConflict)
+	default:
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+	}
+}
+
+// cleanName garde un nom de fichier affichable : pas de chemin, pas de
+// caractère de contrôle, 200 octets max.
+func cleanName(name string) string {
+	name = strings.ToValidUTF8(name, "")
+	name = path.Base(strings.ReplaceAll(name, `\`, "/"))
+	name = strings.Map(func(c rune) rune {
+		if unicode.IsControl(c) {
+			return -1
+		}
+		return c
+	}, name)
+	name = strings.TrimSpace(name)
+	for len(name) > 200 {
+		_, n := utf8.DecodeLastRuneInString(name)
+		name = name[:len(name)-n]
+	}
+	if name == "" || name == "." || name == "/" || name == ".." {
+		return "fichier"
+	}
+	return name
+}
+
+// handleUpload : POST /api/rooms/{id}/files?name=…, corps = contenu brut.
+// Content-Type application/octet-stream obligatoire : un formulaire d'un
+// autre site ne peut pas l'envoyer sans pré-vol CORS (refusé).
+func (s *server) handleUpload(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !roomRe.MatchString(id) {
+		http.NotFound(w, r)
+		return
+	}
+	if mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); mt != "application/octet-stream" {
+		http.Error(w, "application/octet-stream requis", http.StatusUnsupportedMediaType)
+		return
+	}
+	n := r.ContentLength
+	if n < 0 {
+		http.Error(w, "Content-Length requis", http.StatusLengthRequired)
+		return
+	}
+	if n > int64(s.cfg.maxFile) {
+		http.Error(w, fmt.Sprintf("fichier trop gros (max %d Mo)", s.cfg.maxFile>>20), http.StatusRequestEntityTooLarge)
+		return
+	}
+	if err := s.st.reserve(id, int(n)); err != nil {
+		storeErr(w, err)
+		return
+	}
+	// Connexion lente : on laisse plus que le ReadTimeout global.
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(5 * time.Minute))
+	data := make([]byte, n)
+	if _, err := io.ReadFull(r.Body, data); err != nil {
+		s.st.release(id, int(n))
+		http.Error(w, "envoi interrompu", http.StatusBadRequest)
+		return
+	}
+	info, err := s.st.setFile(id, cleanName(r.URL.Query().Get("name")), data)
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(info)
+}
+
+func (s *server) handleFile(w http.ResponseWriter, r *http.Request) {
+	id, fid := r.PathValue("id"), r.PathValue("fid")
+	if !roomRe.MatchString(id) || !fileRe.MatchString(fid) {
+		http.NotFound(w, r)
+		return
+	}
+	f, err := s.st.getFile(id, fid)
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(5 * time.Minute))
+	// Jamais interprété par le navigateur : téléchargement forcé, page isolée.
+	h := w.Header()
+	h.Set("Content-Type", "application/octet-stream")
+	h.Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": f.Name}))
+	h.Set("Content-Security-Policy", "default-src 'none'; sandbox")
+	h.Set("Cache-Control", "no-store")
+	http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(f.data))
+}
+
+func (s *server) handleDelFile(w http.ResponseWriter, r *http.Request) {
+	id, fid := r.PathValue("id"), r.PathValue("fid")
+	if !roomRe.MatchString(id) || !fileRe.MatchString(fid) {
+		http.NotFound(w, r)
+		return
+	}
+	if err := s.st.delFile(id, fid); err != nil {
+		storeErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func securityHeaders(next http.Handler) http.Handler {
@@ -544,7 +786,8 @@ func (s *server) routes() (http.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
-	s.index = bytes.ReplaceAll(index, []byte("__V__"), []byte(s.version))
+	index = bytes.ReplaceAll(index, []byte("__V__"), []byte(s.version))
+	s.index = bytes.ReplaceAll(index, []byte("__MAXFILE__"), []byte(strconv.Itoa(s.cfg.maxFile)))
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.handleNew)
@@ -553,6 +796,9 @@ func (s *server) routes() (http.Handler, error) {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
 	mux.HandleFunc("GET /api/rooms/{id}/events", s.handleEvents)
 	mux.HandleFunc("PUT /api/rooms/{id}", s.handlePut)
+	mux.HandleFunc("POST /api/rooms/{id}/files", s.handleUpload)
+	mux.HandleFunc("GET /api/rooms/{id}/files/{fid}", s.handleFile)
+	mux.HandleFunc("DELETE /api/rooms/{id}/files/{fid}", s.handleDelFile)
 	return securityHeaders(mux), nil
 }
 
