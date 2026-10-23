@@ -28,6 +28,8 @@ import (
 	"os/signal"
 	"path"
 	"regexp"
+	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -62,6 +64,7 @@ type config struct {
 	roomTTL       time.Duration
 	maxDoc        int
 	maxFile       int
+	maxFiles      int
 	maxTotal      int
 	maxRooms      int
 	maxSubs       int
@@ -103,8 +106,9 @@ func loadConfig() (config, error) {
 		def int
 	}{
 		{"MAX_DOC_BYTES", &c.maxDoc, 1 << 20},
-		{"MAX_FILE_BYTES", &c.maxFile, 25 << 20},
-		{"MAX_TOTAL_BYTES", &c.maxTotal, 32 << 20},
+		{"MAX_FILE_BYTES", &c.maxFile, 250 << 20},
+		{"MAX_FILES_PER_ROOM", &c.maxFiles, 3},
+		{"MAX_TOTAL_BYTES", &c.maxTotal, 256 << 20},
 		{"MAX_ROOMS", &c.maxRooms, 500},
 		{"MAX_CONNECTIONS", &c.maxSubs, 200},
 		{"JOIN_PER_MINUTE", &c.joinPerMinute, 30},
@@ -134,7 +138,10 @@ type fileInfo struct {
 
 type file struct {
 	fileInfo
-	data []byte // jamais modifié après l'ajout : lisible hors verrou
+	data    []byte // jamais modifié après l'ajout : lisible hors verrou
+	seq     uint64 // ordre d'arrivée, pour évincer le plus ancien
+	readers int    // téléchargements en cours
+	evicted bool   // retiré de sa salle, mais encore lu : reste compté
 }
 
 type sub struct {
@@ -143,41 +150,29 @@ type sub struct {
 	files    chan []fileInfo
 }
 
-// Une salle porte au plus un fichier : le dernier envoyé remplace le précédent.
 type room struct {
 	ev        event
-	file      *file
-	uploading bool // un envoi à la fois par salle
+	files     []*file // du plus ancien au plus récent
+	uploading bool    // un envoi à la fois par salle
 	updated   time.Time
 	subs      map[*sub]struct{}
 }
 
-func (r *room) fileSize() int {
-	if r.file == nil {
-		return 0
-	}
-	return r.file.Size
-}
-
-// fileList : liste de 0 ou 1 élément, format de l'événement SSE "files".
 func (r *room) fileList() []fileInfo {
-	if r.file == nil {
-		return []fileInfo{}
+	l := make([]fileInfo, len(r.files))
+	for i, f := range r.files {
+		l[i] = f.fileInfo
 	}
-	return []fileInfo{r.file.fileInfo}
-}
-
-// size : octets comptés dans le quota global (texte + fichier).
-func (r *room) size() int {
-	return len(r.ev.T) + r.fileSize()
+	return l
 }
 
 type store struct {
 	cfg   config
 	mu    sync.Mutex
 	rooms map[string]*room
-	total int
+	total int // octets en RAM : textes, fichiers, envois réservés, fichiers évincés encore lus
 	nsubs int
+	seq   uint64
 }
 
 func newStore(cfg config) *store {
@@ -248,7 +243,7 @@ func (s *store) unsubscribe(id string, sb *sub) {
 	}
 	delete(r.subs, sb)
 	s.nsubs--
-	if len(r.subs) == 0 && r.ev.V == 0 && r.file == nil && !r.uploading {
+	if len(r.subs) == 0 && r.ev.V == 0 && len(r.files) == 0 && !r.uploading {
 		delete(s.rooms, id) // salle jamais écrite : rien à garder
 		return
 	}
@@ -275,11 +270,50 @@ func (s *store) put(id, text, lang, from string) (uint64, error) {
 	return r.ev.V, nil
 }
 
-// reserve prend n octets de quota AVANT la lecture d'un fichier, pour que les
-// envois en cours ne puissent pas faire grossir la RAM sans limite. Le fichier
-// actuel de la salle sera remplacé : il est déduit du contrôle, mais reste en
-// mémoire (et téléchargeable) jusqu'à la fin de l'envoi. L'appelant doit
-// ensuite appeler addFile ou release.
+func (s *store) filesChangedLocked(r *room) {
+	r.updated = time.Now()
+	l := r.fileList()
+	for sb := range r.subs {
+		offer(sb.files, l)
+	}
+}
+
+// dropLocked retire le fichier i de la salle. Sa RAM n'est rendue au quota
+// qu'une fois le dernier téléchargement en cours terminé (voir doneFile).
+func (s *store) dropLocked(r *room, i int) {
+	f := r.files[i]
+	// slices.Delete remet à nil la case libérée : avec append, le tableau sous-jacent
+	// garderait un pointeur vers f et ses données ne seraient jamais libérées.
+	r.files = slices.Delete(r.files, i, i+1)
+	if f.readers > 0 {
+		f.evicted = true
+	} else {
+		s.total -= f.Size
+	}
+}
+
+// oldestLocked : le plus ancien fichier du serveur qu'on peut libérer tout de
+// suite (aucun téléchargement en cours).
+func (s *store) oldestLocked() (*room, int) {
+	var best *room
+	bi := -1
+	for _, r := range s.rooms {
+		for i, f := range r.files {
+			if f.readers == 0 && (best == nil || f.seq < best.files[bi].seq) {
+				best, bi = r, i
+			}
+		}
+	}
+	return best, bi
+}
+
+// reserve prépare l'envoi de n octets dans la salle id, AVANT la lecture du
+// corps : la RAM ne dépasse jamais MAX_TOTAL_BYTES. Pour faire de la place, on
+// supprime d'abord le plus ancien fichier de la salle si elle est pleine, puis
+// les plus anciens fichiers du serveur, toutes salles confondues. Si même ça
+// ne suffit pas (textes, autres envois, téléchargements en cours), rien n'est
+// supprimé et l'envoi est refusé. L'appelant doit ensuite appeler setFile ou
+// release.
 func (s *store) reserve(id string, n int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -290,8 +324,32 @@ func (s *store) reserve(id string, n int) error {
 	if r.uploading {
 		return errBusy
 	}
-	if s.total-r.fileSize()+n > s.cfg.maxTotal {
+	freeable := 0
+	for _, o := range s.rooms {
+		for _, f := range o.files {
+			if f.readers == 0 {
+				freeable += f.Size
+			}
+		}
+	}
+	if s.total-freeable+n > s.cfg.maxTotal {
 		return errFull
+	}
+	changed := map[*room]bool{}
+	for len(r.files) >= s.cfg.maxFiles {
+		s.dropLocked(r, 0)
+		changed[r] = true
+	}
+	for s.total+n > s.cfg.maxTotal {
+		o, i := s.oldestLocked()
+		if o == nil { // impossible vu le contrôle ci-dessus ; par prudence
+			return errFull
+		}
+		s.dropLocked(o, i)
+		changed[o] = true
+	}
+	for o := range changed {
+		s.filesChangedLocked(o)
 	}
 	s.total += n
 	r.uploading = true
@@ -307,16 +365,8 @@ func (s *store) release(id string, n int) {
 	}
 }
 
-func (s *store) filesChangedLocked(r *room) {
-	r.updated = time.Now()
-	l := r.fileList()
-	for sb := range r.subs {
-		offer(sb.files, l)
-	}
-}
-
-// setFile installe le fichier réservé par reserve, à la place du précédent.
-// Si la salle a disparu entre-temps, la réservation est rendue.
+// setFile ajoute le fichier réservé par reserve. Si la salle a disparu
+// entre-temps, la réservation est rendue.
 func (s *store) setFile(id, name string, data []byte) (fileInfo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -325,13 +375,18 @@ func (s *store) setFile(id, name string, data []byte) (fileInfo, error) {
 		s.total -= len(data)
 		return fileInfo{}, errNotFound
 	}
-	s.total -= r.fileSize()
-	r.file = &file{fileInfo: fileInfo{ID: genID(10), Name: name, Size: len(data)}, data: data}
 	r.uploading = false
+	if len(r.files) >= s.cfg.maxFiles { // pas possible en principe : un envoi à la fois
+		s.dropLocked(r, 0)
+	}
+	s.seq++
+	f := &file{fileInfo: fileInfo{ID: genID(10), Name: name, Size: len(data)}, data: data, seq: s.seq}
+	r.files = append(r.files, f)
 	s.filesChangedLocked(r)
-	return r.file.fileInfo, nil
+	return f.fileInfo, nil
 }
 
+// getFile ouvre un fichier en lecture ; l'appelant doit appeler doneFile.
 func (s *store) getFile(id, fid string) (*file, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -339,10 +394,22 @@ func (s *store) getFile(id, fid string) (*file, error) {
 	if !ok {
 		return nil, errNotFound
 	}
-	if r.file == nil || r.file.ID != fid {
-		return nil, errNoFile
+	for _, f := range r.files {
+		if f.ID == fid {
+			f.readers++
+			return f, nil
+		}
 	}
-	return r.file, nil
+	return nil, errNoFile
+}
+
+func (s *store) doneFile(f *file) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f.readers--
+	if f.readers == 0 && f.evicted {
+		s.total -= f.Size
+	}
 }
 
 func (s *store) delFile(id, fid string) error {
@@ -352,21 +419,25 @@ func (s *store) delFile(id, fid string) error {
 	if !ok {
 		return errNotFound
 	}
-	if r.file == nil || r.file.ID != fid {
-		return errNoFile
+	for i, f := range r.files {
+		if f.ID == fid {
+			s.dropLocked(r, i)
+			s.filesChangedLocked(r)
+			return nil
+		}
 	}
-	s.total -= r.file.Size
-	r.file = nil
-	s.filesChangedLocked(r)
-	return nil
+	return errNoFile
 }
 
 func (s *store) expire(now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for id, r := range s.rooms {
-		if len(r.subs) == 0 && now.Sub(r.updated) > s.cfg.roomTTL {
-			s.total -= r.size()
+		if len(r.subs) == 0 && !r.uploading && now.Sub(r.updated) > s.cfg.roomTTL {
+			for len(r.files) > 0 {
+				s.dropLocked(r, 0)
+			}
+			s.total -= len(r.ev.T)
 			delete(s.rooms, id)
 		}
 	}
@@ -643,6 +714,10 @@ func cleanName(name string) string {
 	return name
 }
 
+// fileTimeout : durée max d'un envoi ou d'un téléchargement (250 Mo à 1 Mbit/s
+// prennent environ 35 min).
+const fileTimeout = time.Hour
+
 // handleUpload : POST /api/rooms/{id}/files?name=…, corps = contenu brut.
 // Content-Type application/octet-stream obligatoire : un formulaire d'un
 // autre site ne peut pas l'envoyer sans pré-vol CORS (refusé).
@@ -669,8 +744,15 @@ func (s *server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		storeErr(w, err)
 		return
 	}
-	// Connexion lente : on laisse plus que le ReadTimeout global.
-	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(5 * time.Minute))
+	// Les fichiers évincés par reserve ne sont plus référencés : on rend leur
+	// RAM au système avant d'allouer le nouveau, sinon les deux coexistent un
+	// moment (2 × 250 Mo ne tiennent pas dans le conteneur). Un []byte n'a pas
+	// de pointeurs : ce GC forcé est rapide.
+	if n >= 1<<20 {
+		debug.FreeOSMemory()
+	}
+	// Gros fichier ou connexion lente : bien plus que le ReadTimeout global.
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(fileTimeout))
 	data := make([]byte, n)
 	if _, err := io.ReadFull(r.Body, data); err != nil {
 		s.st.release(id, int(n))
@@ -697,7 +779,8 @@ func (s *server) handleFile(w http.ResponseWriter, r *http.Request) {
 		storeErr(w, err)
 		return
 	}
-	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(5 * time.Minute))
+	defer s.st.doneFile(f)
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(fileTimeout))
 	// Jamais interprété par le navigateur : téléchargement forcé, page isolée.
 	h := w.Header()
 	h.Set("Content-Type", "application/octet-stream")

@@ -12,7 +12,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/zedcode .
 FROM scratch
 COPY --from=build /out/zedcode /zedcode
 USER 65532:65532
-ENV ADDR=:8080 GOMEMLIMIT=48MiB
+ENV ADDR=:8080 GOMEMLIMIT=280MiB
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 CMD ["/zedcode", "-healthcheck"]
 ENTRYPOINT ["/zedcode"]

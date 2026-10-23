@@ -190,20 +190,22 @@
     });
   }
 
-  // Un seul fichier par salle : le nouveau remplace l'actuel pour tout le monde.
+  // Envois un par un. Le serveur garde 3 fichiers par salle et supprime les
+  // plus anciens (de la salle, puis du serveur) quand la place manque.
   let uploading = false;
   async function upload(files) {
-    const f = files[0];
-    if (!f || uploading) return;
-    if (maxFile && f.size > maxFile) {
-      setStatus(`${f.name} : trop gros (max ${fmtSize(maxFile)})`, "err");
-      return;
-    }
+    files = Array.from(files);
+    if (!files.length || uploading) return;
     uploading = true;
     $("btn-upload").classList.add("busy");
     try {
-      await sendFile(f);
-      if (files.length > 1) setStatus(`${f.name} partagé (un seul fichier par salle)`, "warn");
+      for (const f of files) {
+        if (maxFile && f.size > maxFile) {
+          setStatus(`${f.name} : trop gros (max ${fmtSize(maxFile)})`, "err");
+          continue;
+        }
+        if (!(await sendFile(f))) break;
+      }
     } finally {
       uploading = false;
       $("btn-upload").classList.remove("busy");

@@ -13,9 +13,11 @@ services:
       ROOM_TTL: ${ROOM_TTL:-2h}
       JOIN_PER_MINUTE: ${JOIN_PER_MINUTE:-30}
       MAX_DOC_BYTES: ${MAX_DOC_BYTES:-1048576}
-      MAX_FILE_BYTES: ${MAX_FILE_BYTES:-26214400}
-      # Textes + fichiers. Rester bien sous la limite mémoire du conteneur (96M).
-      MAX_TOTAL_BYTES: ${MAX_TOTAL_BYTES:-33554432}
+      MAX_FILE_BYTES: ${MAX_FILE_BYTES:-262144000}
+      MAX_FILES_PER_ROOM: ${MAX_FILES_PER_ROOM:-3}
+      # Textes + fichiers, tout en RAM. À garder sous GOMEMLIMIT (280MiB, Dockerfile),
+      # lui-même sous la limite du conteneur (320M) : marge pour le runtime Go.
+      MAX_TOTAL_BYTES: ${MAX_TOTAL_BYTES:-268435456}
     # Aucun volume : tout vit en RAM, rien ne finit dans une sauvegarde.
     read_only: true
     cap_drop:
@@ -32,4 +34,4 @@ services:
       resources:
         limits:
           cpus: "0.25"
-          memory: 96M
+          memory: 320M
