@@ -42,6 +42,14 @@ import (
 //go:embed web
 var webFS embed.FS
 
+// uploadTTL : un envoi interrompu peut être repris pendant ce délai, ensuite
+// sa mémoire est rendue.
+const uploadTTL = 30 * time.Minute
+
+// maxChunk : taille max d'un morceau. Chaque requête doit durer moins de 60 s,
+// limite du proxy Traefik devant le service.
+const maxChunk = 16 << 20
+
 const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
 var (
@@ -49,12 +57,16 @@ var (
 	clientRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,32}$`)
 	langRe   = regexp.MustCompile(`^[a-z0-9]{0,16}$`)
 	fileRe   = regexp.MustCompile(`^[A-Za-z0-9]{10}$`)
+	uploadRe = regexp.MustCompile(`^[A-Za-z0-9]{16}$`)
 
 	errFull     = errors.New("quota mémoire atteint")
 	errTooMany  = errors.New("trop de salles ou de connexions")
 	errNotFound = errors.New("salle inconnue")
 	errNoFile   = errors.New("fichier inconnu")
 	errBusy     = errors.New("un envoi de fichier est déjà en cours dans cette salle")
+	errNoUpload = errors.New("envoi inconnu ou expiré")
+	errOffset   = errors.New("position d'envoi incorrecte")
+	errBadChunk = errors.New("morceau invalide")
 )
 
 // ---------------------------------------------------------------- config
@@ -151,11 +163,24 @@ type sub struct {
 }
 
 type room struct {
-	ev        event
-	files     []*file // du plus ancien au plus récent
-	uploading bool    // un envoi à la fois par salle
-	updated   time.Time
-	subs      map[*sub]struct{}
+	ev      event
+	files   []*file // du plus ancien au plus récent
+	up      *upload // envoi en cours (un seul par salle)
+	updated time.Time
+	subs    map[*sub]struct{}
+}
+
+// upload : envoi en plusieurs morceaux, que le client peut reprendre après
+// une coupure. Ses octets sont réservés dans le quota dès sa création.
+type upload struct {
+	id      string
+	room    string
+	name    string
+	size    int
+	data    []byte // nil tant que la mémoire n'est pas allouée
+	off     int    // octets déjà reçus
+	writing bool   // un morceau est en cours de lecture (hors verrou)
+	last    time.Time
 }
 
 func (r *room) fileList() []fileInfo {
@@ -167,16 +192,17 @@ func (r *room) fileList() []fileInfo {
 }
 
 type store struct {
-	cfg   config
-	mu    sync.Mutex
-	rooms map[string]*room
-	total int // octets en RAM : textes, fichiers, envois réservés, fichiers évincés encore lus
-	nsubs int
-	seq   uint64
+	cfg     config
+	mu      sync.Mutex
+	rooms   map[string]*room
+	total   int // octets en RAM : textes, fichiers, envois réservés, fichiers évincés encore lus
+	nsubs   int
+	seq     uint64
+	uploads map[string]*upload
 }
 
 func newStore(cfg config) *store {
-	return &store{cfg: cfg, rooms: map[string]*room{}}
+	return &store{cfg: cfg, rooms: map[string]*room{}, uploads: map[string]*upload{}}
 }
 
 // offer envoie v sans bloquer ; si le canal est plein, la valeur en attente
@@ -243,7 +269,7 @@ func (s *store) unsubscribe(id string, sb *sub) {
 	}
 	delete(r.subs, sb)
 	s.nsubs--
-	if len(r.subs) == 0 && r.ev.V == 0 && len(r.files) == 0 && !r.uploading {
+	if len(r.subs) == 0 && r.ev.V == 0 && len(r.files) == 0 && r.up == nil {
 		delete(s.rooms, id) // salle jamais écrite : rien à garder
 		return
 	}
@@ -307,22 +333,25 @@ func (s *store) oldestLocked() (*room, int) {
 	return best, bi
 }
 
-// reserve prépare l'envoi de n octets dans la salle id, AVANT la lecture du
-// corps : la RAM ne dépasse jamais MAX_TOTAL_BYTES. Pour faire de la place, on
-// supprime d'abord le plus ancien fichier de la salle si elle est pleine, puis
-// les plus anciens fichiers du serveur, toutes salles confondues. Si même ça
-// ne suffit pas (textes, autres envois, téléchargements en cours), rien n'est
-// supprimé et l'envoi est refusé. L'appelant doit ensuite appeler setFile ou
-// release.
-func (s *store) reserve(id string, n int) error {
+// startUpload prépare l'envoi de n octets dans la salle id, AVANT toute
+// lecture de données : la RAM ne dépasse jamais MAX_TOTAL_BYTES. Pour faire de
+// la place, on supprime d'abord le plus ancien fichier de la salle si elle est
+// pleine, puis les plus anciens fichiers du serveur, toutes salles confondues.
+// Si même ça ne suffit pas (textes, autres envois, téléchargements en cours),
+// rien n'est supprimé et l'envoi est refusé. Un envoi abandonné dans la même
+// salle est annulé. La mémoire est ensuite allouée hors verrou (setData).
+func (s *store) startUpload(id, name string, n int) (*upload, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r, ok := s.rooms[id]
 	if !ok {
-		return errNotFound
+		return nil, errNotFound
 	}
-	if r.uploading {
-		return errBusy
+	if r.up != nil {
+		if r.up.writing {
+			return nil, errBusy
+		}
+		s.abandonLocked(r.up)
 	}
 	freeable := 0
 	for _, o := range s.rooms {
@@ -333,7 +362,7 @@ func (s *store) reserve(id string, n int) error {
 		}
 	}
 	if s.total-freeable+n > s.cfg.maxTotal {
-		return errFull
+		return nil, errFull
 	}
 	changed := map[*room]bool{}
 	for len(r.files) >= s.cfg.maxFiles {
@@ -343,7 +372,7 @@ func (s *store) reserve(id string, n int) error {
 	for s.total+n > s.cfg.maxTotal {
 		o, i := s.oldestLocked()
 		if o == nil { // impossible vu le contrôle ci-dessus ; par prudence
-			return errFull
+			return nil, errFull
 		}
 		s.dropLocked(o, i)
 		changed[o] = true
@@ -352,38 +381,91 @@ func (s *store) reserve(id string, n int) error {
 		s.filesChangedLocked(o)
 	}
 	s.total += n
-	r.uploading = true
-	return nil
+	u := &upload{id: genID(16), room: id, name: name, size: n, writing: true, last: time.Now()}
+	s.uploads[u.id] = u
+	r.up = u
+	return u, nil
 }
 
-func (s *store) release(id string, n int) {
+func (s *store) setData(u *upload, data []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.total -= n
-	if r, ok := s.rooms[id]; ok {
-		r.uploading = false
+	u.data = data
+	u.writing = false
+	u.last = time.Now()
+}
+
+// abandonLocked annule un envoi et rend son quota.
+func (s *store) abandonLocked(u *upload) {
+	delete(s.uploads, u.id)
+	s.total -= u.size
+	if r, ok := s.rooms[u.room]; ok && r.up == u {
+		r.up = nil
 	}
 }
 
-// setFile ajoute le fichier réservé par reserve. Si la salle a disparu
-// entre-temps, la réservation est rendue.
-func (s *store) setFile(id, name string, data []byte) (fileInfo, error) {
+// uploadState : avancement d'un envoi.
+func (s *store) uploadState(id, uid string) (off, size int, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	r, ok := s.rooms[id]
-	if !ok {
-		s.total -= len(data)
-		return fileInfo{}, errNotFound
+	u, ok := s.uploads[uid]
+	if !ok || u.room != id {
+		return 0, 0, errNoUpload
 	}
-	r.uploading = false
+	return u.off, u.size, nil
+}
+
+// beginChunk réserve l'écriture des n octets à partir de off. Le client doit
+// reprendre exactement là où le serveur en est : sinon errOffset, et il relit
+// l'avancement.
+func (s *store) beginChunk(id, uid string, off, n int) (*upload, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.uploads[uid]
+	if !ok || u.room != id {
+		return nil, errNoUpload
+	}
+	if u.writing {
+		return nil, errBusy
+	}
+	if off != u.off {
+		return nil, errOffset
+	}
+	if n == 0 || off+n > u.size {
+		return nil, errBadChunk
+	}
+	u.writing = true
+	return u, nil
+}
+
+// endChunk termine l'écriture d'un morceau. Quand le dernier octet est reçu,
+// le fichier rejoint la salle et done vaut true.
+func (s *store) endChunk(u *upload, n int, ok bool) (info fileInfo, done bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u.writing = false
+	u.last = time.Now()
+	if ok {
+		u.off += n
+	}
+	if u.off < u.size {
+		return fileInfo{}, false, nil
+	}
+	delete(s.uploads, u.id)
+	r, exists := s.rooms[u.room]
+	if !exists {
+		s.total -= u.size
+		return fileInfo{}, false, errNotFound
+	}
+	r.up = nil
 	if len(r.files) >= s.cfg.maxFiles { // pas possible en principe : un envoi à la fois
 		s.dropLocked(r, 0)
 	}
 	s.seq++
-	f := &file{fileInfo: fileInfo{ID: genID(10), Name: name, Size: len(data)}, data: data, seq: s.seq}
+	f := &file{fileInfo: fileInfo{ID: genID(10), Name: u.name, Size: u.size}, data: u.data, seq: s.seq}
 	r.files = append(r.files, f)
 	s.filesChangedLocked(r)
-	return f.fileInfo, nil
+	return f.fileInfo, true, nil
 }
 
 // getFile ouvre un fichier en lecture ; l'appelant doit appeler doneFile.
@@ -432,8 +514,13 @@ func (s *store) delFile(id, fid string) error {
 func (s *store) expire(now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	for _, u := range s.uploads {
+		if !u.writing && now.Sub(u.last) > uploadTTL {
+			s.abandonLocked(u)
+		}
+	}
 	for id, r := range s.rooms {
-		if len(r.subs) == 0 && !r.uploading && now.Sub(r.updated) > s.cfg.roomTTL {
+		if len(r.subs) == 0 && r.up == nil && now.Sub(r.updated) > s.cfg.roomTTL {
 			for len(r.files) > 0 {
 				s.dropLocked(r, 0)
 			}
@@ -681,10 +768,12 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 
 func storeErr(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, errNotFound), errors.Is(err, errNoFile):
+	case errors.Is(err, errNotFound), errors.Is(err, errNoFile), errors.Is(err, errNoUpload):
 		http.Error(w, err.Error(), http.StatusNotFound)
 	case errors.Is(err, errFull):
 		http.Error(w, err.Error(), http.StatusInsufficientStorage)
+	case errors.Is(err, errBadChunk):
+		http.Error(w, err.Error(), http.StatusBadRequest)
 	case errors.Is(err, errBusy):
 		http.Error(w, err.Error(), http.StatusConflict)
 	default:
@@ -714,16 +803,94 @@ func cleanName(name string) string {
 	return name
 }
 
-// fileTimeout : durée max d'un envoi ou d'un téléchargement (250 Mo à 1 Mbit/s
-// prennent environ 35 min).
+// fileTimeout : durée max d'un téléchargement (250 Mo à 1 Mbit/s prennent
+// environ 35 min).
 const fileTimeout = time.Hour
 
-// handleUpload : POST /api/rooms/{id}/files?name=…, corps = contenu brut.
-// Content-Type application/octet-stream obligatoire : un formulaire d'un
-// autre site ne peut pas l'envoyer sans pré-vol CORS (refusé).
-func (s *server) handleUpload(w http.ResponseWriter, r *http.Request) {
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(v)
+}
+
+type uploadResp struct {
+	ID   string    `json:"id"`
+	Off  int       `json:"off"`
+	Size int       `json:"size"`
+	File *fileInfo `json:"file,omitempty"` // présent quand l'envoi est terminé
+}
+
+// handleStartUpload : POST /api/rooms/{id}/uploads, corps JSON {name, size}.
+// JSON obligatoire : un formulaire d'un autre site ne peut pas l'envoyer sans
+// pré-vol CORS (refusé), donc ne peut pas déclencher d'éviction.
+func (s *server) handleStartUpload(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !roomRe.MatchString(id) {
+		http.NotFound(w, r)
+		return
+	}
+	if !isJSON(r) {
+		http.Error(w, "application/json requis", http.StatusUnsupportedMediaType)
+		return
+	}
+	var body struct {
+		Name string `json:"name"`
+		Size int    `json:"size"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Size < 0 {
+		http.Error(w, "requête invalide", http.StatusBadRequest)
+		return
+	}
+	if body.Size > s.cfg.maxFile {
+		http.Error(w, fmt.Sprintf("fichier trop gros (max %d Mo)", s.cfg.maxFile>>20), http.StatusRequestEntityTooLarge)
+		return
+	}
+	u, err := s.st.startUpload(id, cleanName(body.Name), body.Size)
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+	// Les fichiers évincés ne sont plus référencés : on rend leur RAM au
+	// système avant d'allouer, sinon anciens et nouveau coexistent un moment
+	// (2 × 250 Mo ne tiennent pas dans le conteneur). Un []byte n'a pas de
+	// pointeurs : ce GC forcé est rapide.
+	if body.Size >= 1<<20 {
+		debug.FreeOSMemory()
+	}
+	s.st.setData(u, make([]byte, body.Size))
+	resp := uploadResp{ID: u.id, Size: u.size}
+	if u.size == 0 { // fichier vide : rien à recevoir
+		info, _, err := s.st.endChunk(u, 0, true)
+		if err != nil {
+			storeErr(w, err)
+			return
+		}
+		resp.File = &info
+	}
+	writeJSON(w, resp)
+}
+
+// handleUploadState : GET /api/rooms/{id}/uploads/{uid}, pour reprendre.
+func (s *server) handleUploadState(w http.ResponseWriter, r *http.Request) {
+	id, uid := r.PathValue("id"), r.PathValue("uid")
+	if !roomRe.MatchString(id) || !uploadRe.MatchString(uid) {
+		http.NotFound(w, r)
+		return
+	}
+	off, size, err := s.st.uploadState(id, uid)
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, uploadResp{ID: uid, Off: off, Size: size})
+}
+
+// handleChunk : PUT /api/rooms/{id}/uploads/{uid}?off=…, corps = octets bruts.
+// Content-Type application/octet-stream obligatoire (pré-vol CORS).
+func (s *server) handleChunk(w http.ResponseWriter, r *http.Request) {
+	id, uid := r.PathValue("id"), r.PathValue("uid")
+	if !roomRe.MatchString(id) || !uploadRe.MatchString(uid) {
 		http.NotFound(w, r)
 		return
 	}
@@ -731,41 +898,43 @@ func (s *server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "application/octet-stream requis", http.StatusUnsupportedMediaType)
 		return
 	}
+	off, err := strconv.Atoi(r.URL.Query().Get("off"))
 	n := r.ContentLength
-	if n < 0 {
-		http.Error(w, "Content-Length requis", http.StatusLengthRequired)
+	if err != nil || off < 0 || n < 0 || n > maxChunk {
+		http.Error(w, "morceau invalide", http.StatusBadRequest)
 		return
 	}
-	if n > int64(s.cfg.maxFile) {
-		http.Error(w, fmt.Sprintf("fichier trop gros (max %d Mo)", s.cfg.maxFile>>20), http.StatusRequestEntityTooLarge)
+	u, err := s.st.beginChunk(id, uid, off, int(n))
+	if errors.Is(err, errOffset) {
+		// Le client s'est décalé (morceau reçu mais réponse perdue…) : on lui
+		// renvoie la position du serveur.
+		cur, size, _ := s.st.uploadState(id, uid)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(uploadResp{ID: uid, Off: cur, Size: size})
 		return
 	}
-	if err := s.st.reserve(id, int(n)); err != nil {
-		storeErr(w, err)
-		return
-	}
-	// Les fichiers évincés par reserve ne sont plus référencés : on rend leur
-	// RAM au système avant d'allouer le nouveau, sinon les deux coexistent un
-	// moment (2 × 250 Mo ne tiennent pas dans le conteneur). Un []byte n'a pas
-	// de pointeurs : ce GC forcé est rapide.
-	if n >= 1<<20 {
-		debug.FreeOSMemory()
-	}
-	// Gros fichier ou connexion lente : bien plus que le ReadTimeout global.
-	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(fileTimeout))
-	data := make([]byte, n)
-	if _, err := io.ReadFull(r.Body, data); err != nil {
-		s.st.release(id, int(n))
-		http.Error(w, "envoi interrompu", http.StatusBadRequest)
-		return
-	}
-	info, err := s.st.setFile(id, cleanName(r.URL.Query().Get("name")), data)
 	if err != nil {
 		storeErr(w, err)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(info)
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(5 * time.Minute))
+	// writing = true : seul ce handler écrit dans cette zone, lecture hors verrou.
+	_, rerr := io.ReadFull(r.Body, u.data[off:off+int(n)])
+	info, done, err := s.st.endChunk(u, int(n), rerr == nil)
+	if rerr != nil {
+		http.Error(w, "morceau interrompu", http.StatusBadRequest)
+		return
+	}
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+	resp := uploadResp{ID: uid, Off: off + int(n), Size: u.size}
+	if done {
+		resp.File = &info
+	}
+	writeJSON(w, resp)
 }
 
 func (s *server) handleFile(w http.ResponseWriter, r *http.Request) {
@@ -879,7 +1048,9 @@ func (s *server) routes() (http.Handler, error) {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
 	mux.HandleFunc("GET /api/rooms/{id}/events", s.handleEvents)
 	mux.HandleFunc("PUT /api/rooms/{id}", s.handlePut)
-	mux.HandleFunc("POST /api/rooms/{id}/files", s.handleUpload)
+	mux.HandleFunc("POST /api/rooms/{id}/uploads", s.handleStartUpload)
+	mux.HandleFunc("GET /api/rooms/{id}/uploads/{uid}", s.handleUploadState)
+	mux.HandleFunc("PUT /api/rooms/{id}/uploads/{uid}", s.handleChunk)
 	mux.HandleFunc("GET /api/rooms/{id}/files/{fid}", s.handleFile)
 	mux.HandleFunc("DELETE /api/rooms/{id}/files/{fid}", s.handleDelFile)
 	return securityHeaders(mux), nil

@@ -31,12 +31,20 @@ Code de salle : 6 caractères `[A-Za-z0-9]`, soit 62⁶ = 56 800 235 584 combina
 - **Tout est en RAM** : rien sur disque, donc rien dans les sauvegardes Coolify/OVH.
   Un redéploiement vide les salles ; un onglet encore ouvert renvoie alors son contenu.
 - Une salle est effacée `ROOM_TTL` (2 h) après la dernière activité (modification ou départ du dernier appareil), si plus personne n'est connecté.
-- Fichiers : `POST /api/rooms/<code>/files?name=…` (corps brut), servis en téléchargement forcé
-  (`Content-Disposition: attachment`, `application/octet-stream`, CSP `sandbox`) : un fichier HTML
-  ou SVG déposé ne s'exécute jamais dans la page. Le quota est réservé avant la lecture du corps,
-  et la place est faite **avant** (éviction des plus anciens), un seul envoi à la fois par salle
-  (409 sinon). Un fichier évincé pendant qu'on le télécharge reste compté jusqu'à la fin du
-  téléchargement : la RAM des données ne dépasse jamais `MAX_TOTAL_BYTES`.
+- Fichiers : envoi **par morceaux, avec reprise**.
+  `POST /api/rooms/<code>/uploads` (JSON `{name, size}`) réserve la place, puis
+  `PUT /api/rooms/<code>/uploads/<id>?off=…` reçoit chaque morceau (16 Mo max) et
+  `GET /api/rooms/<code>/uploads/<id>` donne l'avancement. Chaque requête reste sous les 60 s
+  après lesquelles le proxy Traefik coupe une requête ; le navigateur ajuste la taille des morceaux
+  au débit (~15 s chacun). Coupure (veille, changement d'appli, réseau) : réessai automatique, ou
+  remettre le même fichier (même nom, même taille) reprend où le serveur en était. Un envoi sans
+  activité pendant 30 min est abandonné. L'écran reste allumé pendant l'envoi (Wake Lock), tant
+  que la page est affichée.
+- Fichiers servis en téléchargement forcé (`Content-Disposition: attachment`,
+  `application/octet-stream`, CSP `sandbox`) : un fichier HTML ou SVG déposé ne s'exécute jamais
+  dans la page. La place est faite **avant** de recevoir les données (éviction des plus anciens),
+  un seul envoi à la fois par salle. Un fichier évincé pendant qu'on le télécharge reste compté
+  jusqu'à la fin du téléchargement : la RAM des données ne dépasse jamais `MAX_TOTAL_BYTES`.
 - Ouvrir une salle est limité à `JOIN_PER_MINUTE` (30) par IP : balayer les codes au hasard
   demanderait des milliards de requêtes. Un PUT sur une salle non ouverte est refusé (404).
 

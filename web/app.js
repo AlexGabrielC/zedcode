@@ -11,6 +11,7 @@
   const store = {
     get: (k) => { try { return localStorage.getItem(k); } catch { return null; } },
     set: (k, v) => { try { localStorage.setItem(k, v); } catch {} },
+    del: (k) => { try { localStorage.removeItem(k); } catch {} },
   };
 
   // ---------- langage ----------
@@ -172,23 +173,114 @@
     // En cas de succès, la liste arrive par l'événement "files".
   }
 
-  function sendFile(f) {
+  // ---------- envoi par morceaux, avec reprise ----------
+  // Chaque morceau est une requête courte : le proxy coupe toute requête de
+  // plus de 60 s. Taille ajustée au débit mesuré pour viser ~15 s par morceau.
+  const CHUNK_MIN = 256 << 10, CHUNK_MAX = 8 << 20, CHUNK_SECONDS = 15;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // Requête XHR (fetch n'expose pas la progression d'envoi). Ne rejette jamais :
+  // status 0 = réseau coupé.
+  function xhr(method, url, body, type, onProgress) {
     return new Promise((resolve) => {
-      const xhr = new XMLHttpRequest();
-      xhr.open("POST", `/api/rooms/${roomId}/files?name=${encodeURIComponent(f.name)}`);
-      xhr.setRequestHeader("Content-Type", "application/octet-stream");
-      xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable) setStatus(`envoi de ${f.name} : ${Math.round(e.loaded / e.total * 100)} %`, "warn");
+      const x = new XMLHttpRequest();
+      x.open(method, url);
+      if (type) x.setRequestHeader("Content-Type", type);
+      if (onProgress) x.upload.onprogress = (e) => onProgress(e.loaded);
+      x.onload = () => {
+        let json = null;
+        try { json = JSON.parse(x.responseText); } catch {}
+        resolve({ status: x.status, json, text: x.responseText.trim() });
       };
-      xhr.onload = () => {
-        if (xhr.status === 200) setStatus(`${f.name} partagé`, "ok");
-        else setStatus(`${f.name} : erreur ${xhr.status} : ${xhr.responseText.trim()}`, "err");
-        resolve(xhr.status === 200);
-      };
-      xhr.onerror = () => { setStatus(`${f.name} : envoi échoué`, "err"); resolve(false); };
-      xhr.send(f);
+      x.onerror = x.onabort = x.ontimeout = () => resolve({ status: 0, json: null, text: "" });
+      x.send(body);
     });
   }
+
+  // Un envoi interrompu est retrouvé par nom + taille : remettre le même
+  // fichier reprend là où le serveur en était.
+  async function sendFile(f) {
+    const key = `zc-up:${roomId}:${f.name}:${f.size}`;
+    const pct = (n) => (f.size ? Math.floor(n / f.size * 100) : 100);
+    let id = store.get(key), off = 0;
+    if (id) {
+      const r = await xhr("GET", `/api/rooms/${roomId}/uploads/${id}`);
+      if (r.status === 200 && r.json && r.json.size === f.size) off = r.json.off;
+      else id = null;
+    }
+    if (id && off) setStatus(`reprise de ${f.name} à ${pct(off)} %`, "warn");
+    if (!id) {
+      const r = await xhr("POST", `/api/rooms/${roomId}/uploads`,
+        JSON.stringify({ name: f.name, size: f.size }), "application/json");
+      if (r.status !== 200 || !r.json) {
+        setStatus(`${f.name} : erreur ${r.status || "réseau"} ${r.text}`, "err");
+        return false;
+      }
+      if (r.json.file) { setStatus(`${f.name} partagé`, "ok"); return true; }
+      id = r.json.id;
+      store.set(key, id);
+    }
+
+    let chunk = 1 << 20, fails = 0;
+    while (off < f.size) {
+      const end = Math.min(f.size, off + chunk);
+      const t0 = performance.now();
+      const r = await xhr("PUT", `/api/rooms/${roomId}/uploads/${id}?off=${off}`,
+        f.slice(off, end), "application/octet-stream",
+        (loaded) => setStatus(`envoi de ${f.name} : ${pct(off + loaded)} %`, "warn"));
+      if (r.status === 200 && r.json) {
+        const secs = (performance.now() - t0) / 1000;
+        chunk = Math.max(CHUNK_MIN, Math.min(CHUNK_MAX, Math.round((end - off) / secs * CHUNK_SECONDS)));
+        off = r.json.off;
+        fails = 0;
+        if (r.json.file) break;
+        continue;
+      }
+      if (r.status === 409 && r.json) { off = r.json.off; continue; } // resynchronisation
+      if (r.status === 404) {
+        store.del(key);
+        // Dernier morceau reçu mais réponse perdue : l'envoi est fini, le
+        // fichier est déjà dans la liste.
+        if (end === f.size) { setStatus(`${f.name} partagé`, "ok"); return true; }
+        setStatus(`${f.name} : envoi expiré (30 min sans activité), recommence`, "err");
+        return false;
+      }
+      if (r.status === 413 || r.status === 415 || r.status === 507) {
+        setStatus(`${f.name} : erreur ${r.status} ${r.text}`, "err");
+        return false;
+      }
+      // Coupure (réseau, veille, changement d'appli, proxy) : on réessaie avec
+      // des morceaux plus petits. Onglet caché : on ne compte pas l'échec.
+      if (!document.hidden) fails++;
+      if (fails > 15) {
+        setStatus(`${f.name} : coupé à ${pct(off)} %, remets le même fichier pour reprendre`, "err");
+        return false;
+      }
+      chunk = Math.max(CHUNK_MIN, chunk >> 1);
+      setStatus(`connexion perdue à ${pct(off)} %, reprise…`, "warn");
+      await sleep(Math.min(30000, 1000 * 2 ** Math.min(fails, 5)));
+    }
+    store.del(key);
+    setStatus(`${f.name} partagé`, "ok");
+    return true;
+  }
+
+  // ---------- écran allumé pendant l'envoi ----------
+  // Le navigateur relâche le verrou dès que la page est cachée : on le
+  // redemande quand elle redevient visible.
+  let wakeLock = null;
+  async function keepAwake(on) {
+    try {
+      if (on && !wakeLock && "wakeLock" in navigator && document.visibilityState === "visible") {
+        wakeLock = await navigator.wakeLock.request("screen");
+        wakeLock.addEventListener("release", () => { wakeLock = null; });
+      } else if (!on && wakeLock) {
+        await wakeLock.release();
+        wakeLock = null;
+      }
+    } catch {} // non supporté ou refusé (batterie faible…) : sans conséquence
+  }
+  document.addEventListener("visibilitychange", () => { if (uploading) keepAwake(true); });
 
   // Envois un par un. Le serveur garde 3 fichiers par salle et supprime les
   // plus anciens (de la salle, puis du serveur) quand la place manque.
@@ -198,6 +290,7 @@
     if (!files.length || uploading) return;
     uploading = true;
     $("btn-upload").classList.add("busy");
+    keepAwake(true);
     try {
       for (const f of files) {
         if (maxFile && f.size > maxFile) {
@@ -209,6 +302,7 @@
     } finally {
       uploading = false;
       $("btn-upload").classList.remove("busy");
+      keepAwake(false);
     }
   }
 
